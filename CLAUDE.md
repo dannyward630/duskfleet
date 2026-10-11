@@ -3,7 +3,8 @@
 Local platform that orchestrates, observes and (later) schedules and evaluates autonomous
 Claude Code agents. An MCP server (stdio) spawns `claude -p --output-format stream-json`
 with a target project as cwd and records every run in SQLite. Design: `PLAN.md`. User
-docs: `README.md`. Keep both in sync when behaviour changes.
+docs: `README.md` (short entry page) and `docs/*.md` (one page per topic). Keep them in
+sync with `PLAN.md` when behaviour changes.
 
 ## Commands
 

@@ -1,0 +1,82 @@
+# MCP server
+
+```bash
+npm run mcp            # = node packages/mcp/dist/index.js
+```
+
+The server speaks MCP over stdio; logs go to stderr. Runs execute as child processes of the
+server, so keep it alive while runs are in progress. On restart, any run still marked
+`running` is closed as `failed` with an "orphaned" error. The server also ticks the
+[scheduler](schedules.md) while it is alive.
+
+After `npm run build`, restart the host (Claude Desktop, or the Claude Code session) to load
+the new code. Config under `config/` needs no restart.
+
+## Connect from Claude Desktop / Claude Cowork
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+
+```json
+{
+  "mcpServers": {
+    "duskfleet": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/duskfleet/packages/mcp/dist/index.js"],
+      "env": {
+        "CLAUDE_BIN": "/Users/you/.local/bin/claude"
+      }
+    }
+  }
+}
+```
+
+Use absolute paths for `node` (`which node`) and set `CLAUDE_BIN`: GUI apps start with a minimal
+`PATH`. Restart Claude Desktop and the `duskfleet` tools appear.
+
+## Connect from Claude Code
+
+```bash
+claude mcp add duskfleet -- node /absolute/path/to/duskfleet/packages/mcp/dist/index.js
+```
+
+Or copy `.mcp.json.example` to `.mcp.json` in this repo (git-ignored, machine-specific) and
+fill in the absolute paths. The dashboard's **MCP** page prints both snippets with your paths.
+
+Child runs never see the caller's MCP servers (`--strict-mcp-config`), so DuskFleet cannot
+recurse into itself.
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `list_agents` | Builtin (`config/agents`) and user (`user_agents_dir`) agents with their `source` and `kind`, grouped in `byProject` |
+| `create_agent` | Write a user agent. **`kind` is required**: `own` (new persona, `system_prompt` required) or `link` (reuse an agent from a project folder: `claude_agent` + `project_path` or `project`, target verified; a new folder is registered in `data/projects.yaml`). Then `id`, optional `name`, `description`, `model`, `permission_mode`, `allowed_tools`, `disallowed_tools`, `effort`, `timeout_minutes`, `max_budget_usd`, `system_prompt`, `inherit_mcp`, `add_dirs`, `claude_agent`, `project`. `overwrite: true` replaces a user agent or overrides a builtin. `bypassPermissions` is not offered. |
+| `list_project_agents` | Agents a project defines in `.claude/agents/*.md` (name, description, tools, model), to reuse via `claude_agent` |
+| `update_agent` | Merge fields into a user agent; `clear: [...]` removes optional fields. Pass `kind` to convert: `link` (with `claude_agent`) or `own` (with a `system_prompt`); `clear: ["claude_agent"]` unlinks and therefore needs a prompt. Builtins are read-only (override them instead). |
+| `delete_agent` | Remove a user agent file; the builtin with the same id, if any, takes over again |
+| `list_projects` | Named projects, allowed roots, executor info |
+| `list_schedules` | Schedules with next/last firing, outcome (`started` \| `skipped_busy` \| `error`) and scheduler status (kill switch, lease holder) |
+| `create_schedule` | `name`, `agent_id`, `prompt`, `cron`, optional `time_zone`, `project_id`, `model`, `enabled` |
+| `update_schedule` | Merge fields; `enabled: false` pauses, `true` resumes from now |
+| `delete_schedule` | Remove a schedule |
+| `run_schedule_now` | Fire a schedule immediately, same busy rules as a tick |
+| `run_agent` | Start a run. `prompt` + (`project_path` \| `project_id`), optional `agent_id`, `model`, `wait_seconds` (≤300). Returns the run immediately unless waiting. |
+| `get_run` | Full run record incl. `claudeSessionId`, `resumeCommand`, tokens, cost, status. `include_output: true` adds the final message and event timeline. |
+| `list_runs` | Recent runs with filters (`status`, `agent_id`, `project_path`, `limit`); `needsReview` per run |
+| `cancel_run` | SIGTERM (then SIGKILL) the run's process; recorded as `cancelled` |
+
+`create_agent` and `update_agent` validate the spec before writing and roll the file back if
+the config no longer loads, so one bad agent file never breaks later config reloads.
+
+## A typical conversation
+
+From Claude Desktop or Claude Code:
+
+> "Create a duskfleet agent `test-fixer` using haiku that may run `npm test` and never edits tests."
+> → `create_agent` writes `data/agents/test-fixer.md`, usable immediately
+
+> "Run the my-coder agent on ~/Projects/my-app: add input validation to the signup form."
+> → `run_agent` returns `run_id` + `claudeSessionId`
+> "How is it going?" → `get_run`
+> "Show me what it said" → `get_run` with `include_output`
+> Open the session yourself: `claude --resume <claudeSessionId>` inside the project.

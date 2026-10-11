@@ -72,7 +72,7 @@ The `result` line is the authoritative source for cost, tokens, turns and termin
 
 ```
 duskfleet/
-├── PLAN.md, README.md, package.json (workspaces), tsconfig.base.json
+├── PLAN.md, README.md, docs/*.md, package.json (workspaces), tsconfig.base.json
 ├── config/                      # declarative, version-controlled
 │   ├── duskfleet.yaml          # global settings (paths, executor defaults, safety gates)
 │   ├── agents/*.md              # agent definitions: YAML frontmatter + Markdown system prompt
