@@ -9,7 +9,7 @@ import { openDatabase } from "@duskfleet/core";
 import { RunRepository } from "@duskfleet/core";
 import { logger } from "@duskfleet/core";
 import { ScheduleRepository, Scheduler } from "@duskfleet/core";
-import type { DuskFleetConfig } from "@duskfleet/core";
+import type { DuskFleetConfig, SchedulerRole } from "@duskfleet/core";
 
 const log = logger("bootstrap");
 
@@ -21,7 +21,12 @@ export interface App {
   close(): void;
 }
 
-export async function bootstrap(entryFileUrl: string): Promise<App> {
+export interface BootstrapOptions {
+  /** How this process shows up as the scheduler lease holder (`serve`, `mcp`, `cli`). */
+  role?: SchedulerRole;
+}
+
+export async function bootstrap(entryFileUrl: string, options: BootstrapOptions = {}): Promise<App> {
   const configDir = resolveConfigDir(entryFileUrl);
   const config = loadConfig(configDir);
   log.info("config loaded", { configDir, dataDir: config.dataDir, agents: [...config.agents.keys()] });
@@ -38,7 +43,7 @@ export async function bootstrap(entryFileUrl: string): Promise<App> {
 
   const runs = new RunManager(config, repo, executor);
   runs.recoverOrphans();
-  const scheduler = new Scheduler(new ScheduleRepository(db), runs, { tickMs: config.scheduler.tickSeconds * 1000 });
+  const scheduler = new Scheduler(new ScheduleRepository(db), runs, { tickMs: config.scheduler.tickSeconds * 1000, role: options.role ?? "unknown" });
 
   return {
     config,

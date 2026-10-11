@@ -18,14 +18,47 @@ candidate minute, so a schedule at 08:00 fires at 08:00 on both sides of a clock
 ## Who ticks
 
 Any DuskFleet process can: the MCP server that Claude Desktop or Claude Code keeps alive, or
-`duskfleet serve` (a plain long-running process, suited to launchd):
+`duskfleet serve`, a plain long-running process:
 
 ```bash
 npm run cli -- serve
 ```
 
 A SQLite lease makes sure only one of them fires at a time; the others stand by and take over
-when the holder stops. The dashboard shows which process holds the lease.
+when the holder stops. The lease records the kind of process (`serve@host:pid`, `mcp@host:pid`);
+the dashboard's Schedules page and `duskfleet doctor` show it.
+
+**Relying on the MCP server alone means schedules stop when Claude Desktop or Claude Code
+closes.** To run them unattended, register `serve` as a per-user service once:
+
+```bash
+npm run cli -- install-service            # writes the unit from your real paths and starts it
+npm run cli -- install-service --print    # only show the unit
+npm run cli -- uninstall-service
+npm run cli -- doctor                     # "scheduler.service" says whether it is running
+```
+
+| Platform | Mechanism | Unit |
+|---|---|---|
+| macOS | launchd LaunchAgent (`RunAtLoad`, `KeepAlive`) | `~/Library/LaunchAgents/com.duskfleet.scheduler.plist` |
+| Linux | systemd user unit (`Restart=always`) | `~/.config/systemd/user/duskfleet.service` |
+| Windows | Task Scheduler logon task, no time limit, restart on failure | task "DuskFleet Scheduler", XML kept under `%LOCALAPPDATA%\DuskFleet` |
+
+All three run as the logged-in user, so the service sees the same `claude` login as your
+terminal, start at login and restart the process if it dies. They append the process output to
+`data/logs/serve.log`. The unit carries absolute paths (node, `packages/mcp/dist/cli.js`, the
+repo, the `claude` binary as `CLAUDE_BIN`) and is never versioned.
+
+Things to know:
+
+- `install-service` is idempotent and restarts the service. **Run it again after every
+  `npm run build`**, otherwise the service keeps running the old code (same as the MCP server).
+- While the machine sleeps nothing runs; missed ticks are not caught up (see Policies).
+- Linux: `loginctl enable-linger $USER` keeps the unit alive when you are logged out.
+- Windows support is implemented but has not been exercised by the maintainers: check
+  `data/logs/serve.log` if `doctor` reports the task running but nothing fires.
+- The MCP server keeps ticking as a fallback: stop the service and it takes over after three
+  ticks (90 s by default).
 
 ## Policies
 

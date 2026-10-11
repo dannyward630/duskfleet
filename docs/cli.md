@@ -14,8 +14,14 @@ npm run cli -- agents
 npm run cli -- projects
 npm run cli -- schedules
 npm run cli -- serve                                      # long-running scheduler process
+npm run cli -- install-service [--print]                  # register `serve` with launchd / systemd --user / Task Scheduler
+npm run cli -- uninstall-service
 npm run cli -- tools                                      # the MCP tool catalogue
 ```
+
+`doctor` also reports the scheduler: whether something is ticking, which kind of process holds
+the lease (`serve`, `mcp`, `cli`) and whether the service is installed and running. See
+[Schedules](schedules.md#who-ticks) for the service.
 
 Each run writes a raw event log to `data/logs/<run_id>.jsonl` and a structured row to SQLite.
 

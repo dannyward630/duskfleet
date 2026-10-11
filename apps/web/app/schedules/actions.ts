@@ -1,0 +1,54 @@
+"use server";
+
+/**
+ * Schedule writes from the dashboard: pause / resume, change when it fires
+ * (cron + time zone) and delete. They go through the same validation as the
+ * MCP tools (core's createSchedule/updateSchedule), write the same DB rows,
+ * and whichever process holds the scheduler lease picks the change up on its
+ * next tick. Runs and builtins are still never touched from here.
+ */
+import { revalidatePath } from "next/cache";
+import { updateSchedule } from "@duskfleet/core";
+import { config, services } from "@/lib/data";
+
+export interface ActionResult {
+  ok: boolean;
+  message: string;
+}
+
+function fail(err: unknown): ActionResult {
+  return { ok: false, message: err instanceof Error ? err.message : String(err) };
+}
+
+export async function setScheduleEnabledAction(id: string, enabled: boolean): Promise<ActionResult> {
+  try {
+    const s = updateSchedule(services().schedules, config(), id, { enabled });
+    revalidatePath("/schedules");
+    return { ok: true, message: enabled ? `Resumed "${s.name}"${s.nextRunAt ? `, next ${new Date(s.nextRunAt).toLocaleString()}` : ""}.` : `Paused "${s.name}".` };
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+export async function updateScheduleWhenAction(id: string, cron: string, timeZone: string): Promise<ActionResult> {
+  try {
+    const s = updateSchedule(services().schedules, config(), id, { cron: cron.trim(), timeZone: timeZone.trim() });
+    revalidatePath("/schedules");
+    return { ok: true, message: `"${s.name}" now runs on "${s.cron}" (${s.timeZone})${s.enabled && s.nextRunAt ? `, next ${new Date(s.nextRunAt).toLocaleString()}` : ""}.` };
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+export async function deleteScheduleAction(id: string): Promise<ActionResult> {
+  try {
+    const repo = services().schedules;
+    const s = repo.get(id);
+    if (!s) return { ok: false, message: "Schedule not found (already deleted?)." };
+    repo.delete(id);
+    revalidatePath("/schedules");
+    return { ok: true, message: `Deleted "${s.name}". Its past runs keep their scheduleId.` };
+  } catch (err) {
+    return fail(err);
+  }
+}

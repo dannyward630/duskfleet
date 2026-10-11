@@ -326,6 +326,15 @@ details.caps .chips { margin-top: 6px; }
 
 /* ---- schedules ----------------------------------------------------------- */
 .runs td.cron-cell .mono { font-size: 0.8rem; }
+.sched-actions { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 0.8rem; margin-top: 8px; }
+.sched-actions .err, .sched-edit .err { color: var(--bad); }
+.sched-edit { display: grid; gap: 6px; margin-top: 8px; font-size: 0.8rem; max-width: 360px; }
+.sched-edit label { display: grid; grid-template-columns: 72px 1fr; align-items: center; gap: 8px; }
+.sched-edit label .l { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.72rem; font-weight: 600; }
+.sched-edit input { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 5px 8px; font: inherit; font-size: 0.84rem; min-width: 0; }
+.sched-edit input:focus-visible { border-color: var(--border-strong); outline: none; }
+.sched-edit .row { display: flex; gap: 6px; }
+.sched-edit .hint { color: var(--faint); font-size: 0.74rem; }
 .runs tr:target td { background: var(--accent-bg); }
 .howto { display: grid; gap: 10px; }
 .howto .cmd pre { font-size: 0.8rem; }

@@ -57,6 +57,10 @@ Then register the MCP server in Claude Desktop or Claude Code (the dashboard's *
 prints the snippet with your paths) and ask the assistant to create agents, start runs and
 set up schedules. See [MCP server](docs/mcp-server.md).
 
+Schedules fire only while a DuskFleet process runs. To keep them firing with Claude Desktop
+closed, register the scheduler as a per-user service once (launchd, systemd `--user` or Task
+Scheduler): `npm run cli -- install-service`. See [Schedules](docs/schedules.md#who-ticks).
+
 Real runs cost money. An agent without an explicit `model` uses the Claude Code default; set
 `haiku` or `sonnet` while experimenting.
 
@@ -66,7 +70,7 @@ Real runs cost money. An agent without an explicit `model` uses the Claude Code 
 |---|---|
 | [Configuration](docs/configuration.md) | `duskfleet.yaml`, projects registry, concurrency limits, environment variables |
 | [Agents](docs/agents.md) | The two agent kinds (own, link), frontmatter, permission modes in unattended runs, project binding, MCP servers inside runs |
-| [Schedules](docs/schedules.md) | Cron schedules, who ticks, busy and kill-switch policies |
+| [Schedules](docs/schedules.md) | Cron schedules, who ticks, running unattended as a service, busy and kill-switch policies |
 | [MCP server](docs/mcp-server.md) | Registering in Claude Desktop and Claude Code, the tool catalogue, a typical conversation |
 | [CLI](docs/cli.md) | Commands, and what a run records |
 | [Dashboard](docs/dashboard.md) | The five views and what "needs review" means |

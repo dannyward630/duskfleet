@@ -1,7 +1,16 @@
 import Link from "next/link";
+import { parseHolder } from "@duskfleet/core";
 import { CopyButton } from "@/components/CopyButton";
+import { ScheduleActions } from "@/components/ScheduleActions";
 import { listSchedules, scheduleFirings, schedulerEnabled, schedulerLease } from "@/lib/data";
 import { fmtRelative, fmtTime, runTitle } from "@/lib/format";
+
+const HOLDER_LABEL: Record<string, string> = {
+  serve: "service",
+  mcp: "MCP host",
+  cli: "CLI",
+  unknown: "unknown process",
+};
 
 export const dynamic = "force-dynamic";
 
@@ -19,6 +28,9 @@ export default function SchedulesPage() {
   const enabled = schedulerEnabled();
   const lease = schedulerLease();
   const leaseLive = lease ? new Date(lease.expiresAt).getTime() > Date.now() : false;
+  const holder = lease && leaseLive ? parseHolder(lease.holder) : null;
+  const holderLabel = holder ? HOLDER_LABEL[holder.role] ?? holder.role : null;
+  const mcpOnly = enabled && holder !== null && holder.role !== "serve";
   const paused = schedules.filter((s) => !s.enabled);
   const example = schedules[0];
   const enableExample = example ? `update_schedule { "id": "${example.id}", "enabled": true }` : `update_schedule { "id": "<schedule id>", "enabled": true }`;
@@ -34,16 +46,26 @@ export default function SchedulesPage() {
             title={
               enabled
                 ? leaseLive && lease
-                  ? `Lease held by ${lease.holder} (host:pid) until ${fmtTime(lease.expiresAt)}. Only the lease holder ticks.`
+                  ? `Lease held by ${lease.holder} (${holderLabel}, host:pid) until ${fmtTime(lease.expiresAt)}. Only the lease holder ticks.`
                   : "scheduler.enabled is true but no DuskFleet process holds the lease right now"
                 : "scheduler.enabled: false in config/duskfleet.yaml"
             }
           >
-            {enabled ? (leaseLive ? "scheduler active" : "no process ticking") : "scheduler off"}
+            {enabled ? (leaseLive ? `ticking · ${holderLabel}` : "no process ticking") : "scheduler off"}
           </span>
-          <span>read-only view · managed over MCP, see below</span>
+          <span>pause, resume, edit when, delete here · create over MCP, see below</span>
         </span>
       </div>
+
+      {mcpOnly && (
+        <div className="callout warn" style={{ marginBottom: 16 }}>
+          <span className="icon">!</span>
+          <div>
+            <strong>Ticking from an {holderLabel} only.</strong> Schedules stop firing when Claude Desktop / Claude Code closes. To run them
+            unattended install the service once: <code>npm run cli -- install-service</code> (launchd, systemd --user or Task Scheduler).
+          </div>
+        </div>
+      )}
 
       {!enabled && (
         <div className="callout bad" style={{ marginBottom: 16 }}>
@@ -56,7 +78,8 @@ export default function SchedulesPage() {
           <span className="icon">!</span>
           <div>
             <strong>No DuskFleet process is ticking.</strong> Schedules fire only while the MCP server (Claude Desktop / Claude Code) or
-            <code> duskfleet serve</code> is running. Missed ticks are not caught up.
+            <code> duskfleet serve</code> is running. Install it as a service once with <code>npm run cli -- install-service</code>. Missed
+            ticks are not caught up.
           </div>
         </div>
       )}
@@ -64,8 +87,8 @@ export default function SchedulesPage() {
         <div className="callout warn" style={{ marginBottom: 16 }}>
           <span className="icon">!</span>
           <div>
-            <strong>All {schedules.length} schedules are paused.</strong> Nothing will fire. Each row shows when it was paused; re-enable one from an MCP client with{" "}
-            <code>{enableExample}</code>.
+            <strong>All {schedules.length} schedules are paused.</strong> Nothing will fire. Each row shows when it was paused; press <strong>Resume</strong> on
+            one, or from an MCP client send <code>{enableExample}</code>.
           </div>
         </div>
       )}
@@ -124,6 +147,7 @@ export default function SchedulesPage() {
                     <div className="muted" style={{ fontSize: "0.8rem", marginTop: 4, maxWidth: 520 }} title={s.prompt}>
                       {runTitle(s.prompt, 90)}
                     </div>
+                    <ScheduleActions id={s.id} name={s.name} enabled={s.enabled} cron={s.cron} timeZone={s.timeZone} />
                   </td>
                   <td className="cron-cell">
                     <div>{s.cronHuman}</div>
@@ -176,9 +200,11 @@ export default function SchedulesPage() {
       <h2>Manage schedules</h2>
       <div className="card howto">
         <div className="muted" style={{ fontSize: "0.9rem" }}>
-          This page only reads. Create, pause, resume, edit or fire a schedule from any MCP client connected to DuskFleet
-          (Claude Desktop, Claude Code): <code>create_schedule</code>, <code>update_schedule</code>, <code>run_schedule_now</code>,{" "}
-          <code>delete_schedule</code>. The CLI lists them with <code>npm run cli -- schedules</code>.
+          Each row has <strong>Pause / Resume</strong>, <strong>Edit when</strong> (cron and time zone) and <strong>Delete</strong>; they
+          apply the same validation as the MCP tools and whichever process ticks picks the change up on its next tick. Creating a schedule,
+          changing its agent, project, prompt or model, and firing it now still go through an MCP client (Claude Desktop, Claude Code):{" "}
+          <code>create_schedule</code>, <code>update_schedule</code>, <code>run_schedule_now</code>. The CLI lists them with{" "}
+          <code>npm run cli -- schedules</code>.
         </div>
         <div className="two-col">
           <div>
