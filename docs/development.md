@@ -11,10 +11,13 @@ duskfleet/
 ├── packages/
 │   ├── core/            @duskfleet/core — domain: config, storage, execution, orchestration, scheduler, evals
 │   └── mcp/             @duskfleet/mcp  — MCP server (stdio) + CLI + tests
-├── apps/
-│   └── web/             @duskfleet/web  — Next.js dashboard (read-only)
-└── playground/          tiny Node project used as a run target (its slugify is meant to be broken)
+└── apps/
+    └── web/             @duskfleet/web  — Next.js dashboard (read-only)
 ```
+
+A local `playground/` directory is ignored by version control: put a throwaway project there
+(or anywhere else) to use as a run target while trying things out, and register it in the
+private `data/projects.yaml`.
 
 `core` has no knowledge of MCP or React. `mcp` and `web` both depend on `core` and nothing else
 from each other. The dashboard reads the database the MCP server writes (SQLite WAL allows this).

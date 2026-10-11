@@ -44,11 +44,11 @@ npm run build
 npm run cli -- doctor          # Claude binary, version, where config and data live
 ```
 
-Try a run on the bundled playground (a tiny Node project with a failing test), with the
-cheapest model:
+Try a run on a small throwaway project of your own (anything with a failing test will do),
+with the cheapest model:
 
 ```bash
-npm run cli -- run --project-id playground --model haiku -- "Fix the failing slugify test"
+npm run cli -- run --project /abs/path/to/scratch-project --model haiku -- "Fix the failing test"
 npm run cli -- runs
 npm run web                    # dashboard on http://localhost:4777
 ```
