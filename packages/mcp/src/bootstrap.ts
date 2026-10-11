@@ -1,0 +1,54 @@
+/**
+ * Shared start-up for the MCP server and the CLI: load config, open the
+ * database, build the executor and the RunManager.
+ */
+import { loadConfig, resolveConfigDir } from "@duskfleet/core";
+import { ClaudeCodeExecutor } from "@duskfleet/core";
+import { RunManager } from "@duskfleet/core";
+import { openDatabase } from "@duskfleet/core";
+import { RunRepository } from "@duskfleet/core";
+import { logger } from "@duskfleet/core";
+import { ScheduleRepository, Scheduler } from "@duskfleet/core";
+import type { DuskFleetConfig } from "@duskfleet/core";
+
+const log = logger("bootstrap");
+
+export interface App {
+  config: DuskFleetConfig;
+  runs: RunManager;
+  scheduler: Scheduler;
+  executor: ClaudeCodeExecutor;
+  close(): void;
+}
+
+export async function bootstrap(entryFileUrl: string): Promise<App> {
+  const configDir = resolveConfigDir(entryFileUrl);
+  const config = loadConfig(configDir);
+  log.info("config loaded", { configDir, dataDir: config.dataDir, agents: [...config.agents.keys()] });
+
+  const db = openDatabase(config.dataDir);
+  const repo = new RunRepository(db);
+  const executor = new ClaudeCodeExecutor({
+    binary: config.claude.binary,
+    strictMcpConfig: config.claude.strictMcpConfig,
+    settingSources: config.claude.settingSources,
+    allowBypassPermissions: config.claude.allowBypassPermissions,
+  });
+  log.info("executor ready", { binary: executor.binary });
+
+  const runs = new RunManager(config, repo, executor);
+  runs.recoverOrphans();
+  const scheduler = new Scheduler(new ScheduleRepository(db), runs, { tickMs: config.scheduler.tickSeconds * 1000 });
+
+  return {
+    config,
+    runs,
+    scheduler,
+    executor,
+    close: () => {
+      scheduler.stop();
+      runs.shutdown();
+      db.close();
+    },
+  };
+}

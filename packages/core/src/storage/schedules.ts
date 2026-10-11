@@ -1,0 +1,180 @@
+/**
+ * SQLite persistence for schedules, their firing log, and the scheduler lease
+ * that makes sure only one process ticks at a time (the MCP server inside
+ * Claude Desktop and a `duskfleet serve` under launchd may both be alive).
+ */
+import type { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
+import type { Schedule, ScheduleFiring, ScheduleInput, ScheduleOutcome, SchedulePatch } from "../scheduler/types.js";
+
+interface ScheduleRow {
+  id: string;
+  name: string;
+  agent_id: string;
+  project_id: string | null;
+  prompt: string;
+  model: string | null;
+  cron: string;
+  time_zone: string;
+  enabled: number;
+  created_at: string;
+  updated_at: string;
+  next_run_at: string | null;
+  last_fired_at: string | null;
+  last_outcome: string | null;
+  last_error: string | null;
+  last_run_id: string | null;
+  fires: number;
+  skips: number;
+}
+
+function rowToSchedule(r: ScheduleRow): Schedule {
+  return {
+    id: r.id,
+    name: r.name,
+    agentId: r.agent_id,
+    projectId: r.project_id,
+    prompt: r.prompt,
+    model: r.model,
+    cron: r.cron,
+    timeZone: r.time_zone,
+    enabled: r.enabled === 1,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    nextRunAt: r.next_run_at,
+    lastFiredAt: r.last_fired_at,
+    lastOutcome: (r.last_outcome as ScheduleOutcome | null) ?? null,
+    lastError: r.last_error,
+    lastRunId: r.last_run_id,
+    fires: r.fires,
+    skips: r.skips,
+  };
+}
+
+export class ScheduleRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  list(): Schedule[] {
+    return (this.db.prepare("SELECT * FROM schedules ORDER BY enabled DESC, next_run_at IS NULL, next_run_at, name").all() as unknown as ScheduleRow[]).map(rowToSchedule);
+  }
+
+  get(id: string): Schedule | null {
+    const row = this.db.prepare("SELECT * FROM schedules WHERE id = ?").get(id) as unknown as ScheduleRow | undefined;
+    return row ? rowToSchedule(row) : null;
+  }
+
+  findByName(name: string): Schedule | null {
+    const row = this.db.prepare("SELECT * FROM schedules WHERE name = ?").get(name) as unknown as ScheduleRow | undefined;
+    return row ? rowToSchedule(row) : null;
+  }
+
+  /** Enabled schedules whose next_run_at is at or before `now`. */
+  due(nowIso: string): Schedule[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM schedules WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at")
+        .all(nowIso) as unknown as ScheduleRow[]
+    ).map(rowToSchedule);
+  }
+
+  insert(input: ScheduleInput & { nextRunAt: string | null }): Schedule {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO schedules (id, name, agent_id, project_id, prompt, model, cron, time_zone, enabled, created_at, updated_at, next_run_at,
+           last_fired_at, last_outcome, last_error, last_run_id, fires, skips)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0)`,
+      )
+      .run(
+        id,
+        input.name,
+        input.agentId,
+        input.projectId ?? null,
+        input.prompt,
+        input.model ?? null,
+        input.cron,
+        input.timeZone ?? "Europe/London",
+        input.enabled === false ? 0 : 1,
+        now,
+        now,
+        input.nextRunAt,
+      );
+    return this.get(id)!;
+  }
+
+  update(id: string, patch: SchedulePatch & { nextRunAt?: string | null }): Schedule {
+    const sets: string[] = ["updated_at = ?"];
+    const values: Array<string | number | null> = [new Date().toISOString()];
+    const map: Record<string, string> = {
+      name: "name",
+      agentId: "agent_id",
+      projectId: "project_id",
+      prompt: "prompt",
+      model: "model",
+      cron: "cron",
+      timeZone: "time_zone",
+      enabled: "enabled",
+      nextRunAt: "next_run_at",
+    };
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === undefined || !(k in map)) continue;
+      sets.push(`${map[k]} = ?`);
+      values.push(typeof v === "boolean" ? (v ? 1 : 0) : (v as string | null));
+    }
+    values.push(id);
+    this.db.prepare(`UPDATE schedules SET ${sets.join(", ")} WHERE id = ?`).run(...values);
+    return this.get(id)!;
+  }
+
+  delete(id: string): boolean {
+    const r = this.db.prepare("DELETE FROM schedules WHERE id = ?").run(id);
+    return Number(r.changes) > 0;
+  }
+
+  /** Record a firing attempt and advance the schedule. */
+  recordFiring(id: string, outcome: ScheduleOutcome, runId: string | null, error: string | null, nextRunAt: string | null): void {
+    const now = new Date().toISOString();
+    this.db.prepare("INSERT INTO schedule_firings (schedule_id, fired_at, outcome, run_id, error) VALUES (?, ?, ?, ?, ?)").run(id, now, outcome, runId, error);
+    this.db
+      .prepare(
+        `UPDATE schedules SET last_fired_at = ?, last_outcome = ?, last_error = ?, last_run_id = COALESCE(?, last_run_id),
+           fires = fires + ?, skips = skips + ?, next_run_at = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(now, outcome, error, runId, outcome === "started" ? 1 : 0, outcome === "started" ? 0 : 1, nextRunAt, now, id);
+  }
+
+  firings(scheduleId: string, limit = 20): ScheduleFiring[] {
+    return (
+      this.db
+        .prepare("SELECT id, schedule_id, fired_at, outcome, run_id, error FROM schedule_firings WHERE schedule_id = ? ORDER BY id DESC LIMIT ?")
+        .all(scheduleId, limit) as Array<{ id: number; schedule_id: string; fired_at: string; outcome: string; run_id: string | null; error: string | null }>
+    ).map((r) => ({ id: r.id, scheduleId: r.schedule_id, firedAt: r.fired_at, outcome: r.outcome as ScheduleOutcome, runId: r.run_id, error: r.error }));
+  }
+
+  // ---- lease ---------------------------------------------------------------
+
+  /**
+   * Try to take or renew the single scheduler lease for `ttlMs`. Returns true when
+   * this holder owns it. Another live holder keeps it until its lease expires.
+   */
+  acquireLease(holder: string, ttlMs: number): boolean {
+    const now = Date.now();
+    const expires = new Date(now + ttlMs).toISOString();
+    const nowIso = new Date(now).toISOString();
+    this.db.prepare("INSERT OR IGNORE INTO scheduler_lease (id, holder, expires_at) VALUES (1, ?, ?)").run(holder, expires);
+    const r = this.db
+      .prepare("UPDATE scheduler_lease SET holder = ?, expires_at = ? WHERE id = 1 AND (holder = ? OR expires_at < ?)")
+      .run(holder, expires, holder, nowIso);
+    return Number(r.changes) > 0;
+  }
+
+  releaseLease(holder: string): void {
+    this.db.prepare("UPDATE scheduler_lease SET expires_at = ? WHERE id = 1 AND holder = ?").run(new Date(0).toISOString(), holder);
+  }
+
+  leaseInfo(): { holder: string; expiresAt: string } | null {
+    const r = this.db.prepare("SELECT holder, expires_at FROM scheduler_lease WHERE id = 1").get() as { holder: string; expires_at: string } | undefined;
+    return r ? { holder: r.holder, expiresAt: r.expires_at } : null;
+  }
+}

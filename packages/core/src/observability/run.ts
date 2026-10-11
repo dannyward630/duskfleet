@@ -1,0 +1,101 @@
+/**
+ * The Run model: one structured record per agent execution.
+ * This is what SQLite stores and what MCP tools return.
+ */
+
+import type { DeniedTool, RunMcpInfo } from "../execution/types.js";
+
+export const RUN_STATUSES = ["pending", "running", "completed", "failed", "cancelled", "timed_out"] as const;
+export type RunStatus = (typeof RUN_STATUSES)[number];
+
+export const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "cancelled", "timed_out"]);
+
+export function isTerminal(status: RunStatus): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
+
+/** Exactly what was spawned. Recorded before execution starts. */
+export interface RecordedCommand {
+  binary: string;
+  argv: string[];
+  cwd: string;
+}
+
+export interface Run {
+  id: string;
+  agentId: string;
+  projectPath: string;
+  projectId: string | null;
+  prompt: string;
+  modelRequested: string | null;
+  modelUsed: string | null;
+  status: RunStatus;
+  createdAt: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  durationMs: number | null;
+  claudeSessionId: string | null;
+  permissionMode: string;
+  command: RecordedCommand;
+  exitCode: number | null;
+  terminationReason: string | null;
+  error: string | null;
+  resultText: string | null;
+  numTurns: number | null;
+  toolCalls: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheCreationTokens: number | null;
+  costUsd: number | null;
+  permissionDenials: number | null;
+  /** Tool calls refused by the permission system. Non-empty = the agent's allow-list is incomplete. */
+  deniedTools: DeniedTool[];
+  /** MCP servers mounted / used in this run and allow-list entries that matched none of them. */
+  mcp: RunMcpInfo;
+  /**
+   * True when the run hit at least one permission denial. Kept for compatibility;
+   * in unattended runs nobody can intervene, so read it as "needs review".
+   */
+  humanIntervention: boolean;
+  contextExhausted: boolean;
+  retries: number;
+  logPath: string | null;
+  rawResultJson: string | null;
+  /** Set when the run was started by a schedule. */
+  scheduleId: string | null;
+}
+
+export interface RunEvent {
+  id: number;
+  runId: string;
+  ts: string;
+  type: "status_change" | "init" | "tool_use" | "error" | "note";
+  payload: unknown;
+}
+
+/** Compact view used by list_runs. */
+export function summarizeRun(run: Run) {
+  return {
+    id: run.id,
+    status: run.status,
+    agentId: run.agentId,
+    scheduleId: run.scheduleId,
+    projectPath: run.projectPath,
+    projectId: run.projectId,
+    prompt: run.prompt.length > 140 ? run.prompt.slice(0, 137) + "..." : run.prompt,
+    model: run.modelUsed ?? run.modelRequested,
+    claudeSessionId: run.claudeSessionId,
+    createdAt: run.createdAt,
+    durationMs: run.durationMs,
+    costUsd: run.costUsd,
+    numTurns: run.numTurns,
+    toolCalls: run.toolCalls,
+    deniedTools: run.deniedTools,
+    mcpAllowListedMissing: run.mcp.allowListedMissing,
+    needsReview: run.humanIntervention || run.contextExhausted || run.mcp.allowListedMissing.length > 0,
+    humanIntervention: run.humanIntervention,
+    contextExhausted: run.contextExhausted,
+    error: run.error,
+  };
+}

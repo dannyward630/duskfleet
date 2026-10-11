@@ -1,0 +1,67 @@
+# DuskFleet global configuration.
+# Relative paths are resolved from the directory containing this file.
+
+# Where runtime data lives (SQLite database and per-run logs). Git-ignored.
+data_dir: ../data
+
+# Where agents created at runtime (create_agent over MCP, or by hand) are stored.
+# Agents in config/agents are the versioned builtins; a user agent with the same id
+# overrides the builtin. Default: <data_dir>/agents (git-ignored).
+user_agents_dir: null
+
+# Private project registry, merged over config/projects.yaml (same id = private wins).
+# Keep machine-specific absolute paths here, never in the versioned file.
+# Default: <data_dir>/projects.yaml (git-ignored).
+user_projects_file: null
+
+# Optional safety fence: when non-empty, a project path must be inside one of these
+# directories to be executed. Use absolute paths or ~. Leave empty to allow any
+# existing directory except / and your home directory itself.
+allowed_project_roots: []
+#  - ~/Documents/Projects
+
+# Agent used by run_agent when no agent_id is supplied. Leave unset (null) to make
+# agent_id mandatory: every agent here is bound to a project, so there is no sensible default.
+default_agent: null
+
+# Maximum number of Claude Code processes running at the same time.
+max_concurrent_runs: 2
+# Two agents in the same working copy would fight over branches and files, and a
+# scheduler tick must not start an agent whose previous run is still going. A
+# run_agent that would exceed these is refused with a clear error (not queued).
+max_concurrent_per_project: 1
+max_concurrent_per_agent: 1
+
+# Schedules live in the database (create_schedule over MCP, or the dashboard shows
+# them). The scheduler ticks inside whichever DuskFleet process holds the lease:
+# the MCP server Claude Desktop keeps alive, or `duskfleet serve` under launchd.
+scheduler:
+  enabled: true            # kill switch, re-read every tick: false stops all firing
+  tick_seconds: 30
+  default_time_zone: Europe/London
+
+claude:
+  # Path to the Claude Code binary. Resolution order: CLAUDE_BIN env var, this
+  # value, `claude` on PATH, ~/.local/bin/claude. GUI-launched MCP servers often
+  # have a minimal PATH, so setting this explicitly is the most reliable option.
+  binary: null
+  # Default for runs: true = --strict-mcp-config, the child session sees no MCP
+  # server at all (fast, and it cannot recurse into DuskFleet). An agent or a
+  # project with inherit_mcp: true opts out and sees the MCP servers of the user
+  # running DuskFleet, including claude.ai connectors (Atlassian, Figma, ...).
+  # false = every run inherits everything. Verified 2026-10-08: with strict a run
+  # sees 25 tools, without it 168 (140 from connectors).
+  strict_mcp_config: true
+  # Which Claude Code settings files the child session loads: user, project, local.
+  # null = Claude's default (all of them). Unattended runs can hang on user-level
+  # hooks that expect a terminal or a desktop session; setting [project, local]
+  # keeps the target project's own settings while skipping ~/.claude/settings.json.
+  # Note: this also skips user-level permission allow-lists.
+  setting_sources: [project, local]
+  # bypassPermissions is refused by Claude Code in unattended runs
+  # (--permission-prompts none), so this gate only changes the error message.
+  # Use dontAsk with an explicit allowed_tools list instead.
+  allow_bypass_permissions: false
+  # Default per-run limits, overridable per agent.
+  default_timeout_minutes: 30
+  default_max_budget_usd: 5

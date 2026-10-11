@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.next/
+next-env.d.ts
+data/
+*.tsbuildinfo
+*.log
+.DS_Store
+playground/node_modules/
+# machine-specific MCP registration; copy from .mcp.json.example
+.mcp.json
+
+# private notes (journal, TODO, research) and the Obsidian vault config: never committed
+notes/
+.obsidian/

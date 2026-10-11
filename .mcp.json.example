@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "duskfleet": {
+      "type": "stdio",
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/duskfleet/packages/mcp/dist/index.js"],
+      "env": { "CLAUDE_BIN": "/absolute/path/to/claude" }
+    }
+  }
+}

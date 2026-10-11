@@ -1,0 +1,24 @@
+{
+  "name": "@duskfleet/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DuskFleet MCP server (stdio) and local CLI",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "duskfleet": "./dist/cli.js",
+    "duskfleet-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node dist/tools-catalog.js --write dist/tools.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js",
+    "test": "node --test test/*.test.js",
+    "tools": "node dist/tools-catalog.js"
+  },
+  "dependencies": {
+    "@duskfleet/core": "0.1.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "zod": "^4.6.5"
+  }
+}

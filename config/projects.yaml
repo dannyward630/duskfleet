@@ -1,0 +1,23 @@
+# Versioned registry of named projects so MCP callers can say project_id instead of
+# a full path. Every entry is still validated at run time.
+#
+# Only repo-relative examples belong here. Your own projects go in the PRIVATE
+# registry (default data/projects.yaml, git-ignored, see user_projects_file in
+# duskfleet.yaml) with the same syntax; a private entry with the same id wins.
+#
+# Paths: absolute, or ~/..., or relative to the directory of the file they are in.
+#
+# Per-project options:
+#   inherit_mcp: true   runs on this project see the MCP servers of the user running
+#                       DuskFleet (claude.ai connectors such as Atlassian and Figma).
+#                       Default false = --strict-mcp-config, no MCP at all. The agent
+#                       still needs allowed_tools entries like "mcp__claude_ai_Figma".
+#   add_dirs: [...]     extra directories the run may read/write (--add-dir). Runs are
+#                       otherwise confined to the project directory.
+projects:
+  duskfleet:
+    path: ..
+    description: DuskFleet itself
+  playground:
+    path: ../playground
+    description: Tiny Node project with a failing slugify test, used to try DuskFleet
