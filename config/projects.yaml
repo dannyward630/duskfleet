@@ -18,6 +18,3 @@ projects:
   duskfleet:
     path: ..
     description: DuskFleet itself
-  playground:
-    path: ../playground
-    description: Tiny Node project with a failing slugify test, used to try DuskFleet

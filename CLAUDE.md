@@ -46,8 +46,8 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
 - `data/`: `duskfleet.db`, `logs/<run_id>.jsonl` and `agents/*.md` (user agents written by
   `create_agent`; same id as a builtin overrides it). Git-ignored runtime state. Code must
   never write into `config/agents`; agent file I/O lives in `core/src/config/agent-files.ts`.
-- `playground/`: tiny Node project used as a run target when trying things out. Not part
-  of the product; its `slugify` is meant to be broken and fixed by agents.
+- `playground/`: ignored scratch directory for a local run target when trying things out.
+  Not part of the repo; register it in the private `data/projects.yaml` if needed.
 - `notes/`: private, never committed (`.gitignore`): daily journal (`notes/journal/daily/`),
   `notes/TODO.md` (backlog and launch plan) and research notes. The Obsidian vault is the repo
   root; `.obsidian/` is ignored too. Nothing in `notes/` may be referenced from versioned files.

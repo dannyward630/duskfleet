@@ -6,7 +6,8 @@ data/
 *.tsbuildinfo
 *.log
 .DS_Store
-playground/node_modules/
+# local scratch project used as a run target when trying things out; not part of the repo
+playground/
 # machine-specific MCP registration; copy from .mcp.json.example
 .mcp.json
 

@@ -269,7 +269,7 @@ Future: `scheduled` (before `pending`) once the scheduler exists.
     `-C <dir>` = project cwd; `--add-dir` = `add_dirs`; `-m` = model; `--sandbox read-only` for
     read-only agents and `workspace-write` for editing agents (no approval prompts in either);
     `--ephemeral` (no session files on disk); `--output-last-message <file>` for a clean final
-    result; `--skip-git-repo-check` (the playground is not a Git repo). Re-verify every flag
+    result; `--skip-git-repo-check` (a scratch target may not be a Git repo). Re-verify every flag
     against `codex exec --help` before use, as for `claude`.
   - Gaps, no one-to-one equivalent: no per-tool `allowed_tools` / `disallowed_tools` (control is
     per sandbox; execpolicy `.rules` files are the closest thing); no `--agent <name>` and no
@@ -279,7 +279,7 @@ Future: `scheduled` (before `pending`) once the scheduler exists.
   - Design: `runtime: claude | codex` in the agent frontmatter (default `claude`), `RunManager`
     picks the executor from a map keyed by runtime. `contextExhausted` stays structured-only.
   - First step when picked up: capture two or three real `codex exec --json` runs against
-    `playground/` and add them as fixtures to the test suite (a `fake-codex.js` beside
+    a local scratch project and add them as fixtures to the test suite (a `fake-codex.js` beside
     `fake-claude.js`) before writing the executor.
   - Sequencing: after deterministic evals. Two runtimes pay off when evals can compare them on the
     same task; before that it is a second binary to maintain.
