@@ -118,8 +118,8 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
   resolve the module.
 - Renamed from Gab Factory on 2026-10-11. `openDatabase` adopts a legacy `data/gabfactory.db`
   (with WAL files) on first open; keep that shim until the old name is forgotten.
-- Not a Git repository yet (as of 2026-10-11): `git init` is blocked inside the sandbox, the owner
-  runs it. Target remote: `github.com/duskfleet/duskfleet`.
+- Git: public repo `github.com/duskfleet/duskfleet`, branch `main`, first commit 2026-10-11.
+  Git commands that write `.git` fail inside the sandbox; run them outside it.
 
 ## Roadmap (see PLAN.md §7)
 
