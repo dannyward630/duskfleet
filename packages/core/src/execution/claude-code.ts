@@ -264,6 +264,7 @@ function finalResult(input: {
     deniedTools: r?.deniedTools ?? [],
     contextExhausted: looksLikeContextExhaustion(r),
     rawResult: r?.raw ?? null,
+    subagents: [...input.state.subagents.values()],
   };
 }
 

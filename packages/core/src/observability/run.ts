@@ -3,7 +3,7 @@
  * This is what SQLite stores and what MCP tools return.
  */
 
-import type { DeniedTool, RunMcpInfo } from "../execution/types.js";
+import type { DeniedTool, RunMcpInfo, SubagentRecord } from "../execution/types.js";
 
 export const RUN_STATUSES = ["pending", "running", "completed", "failed", "cancelled", "timed_out"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
@@ -70,8 +70,20 @@ export interface RunEvent {
   id: number;
   runId: string;
   ts: string;
-  type: "status_change" | "init" | "tool_use" | "error" | "note";
+  type: "status_change" | "init" | "tool_use" | "error" | "note" | "subagent_start" | "subagent_end";
   payload: unknown;
+  /** Subagent (Claude Code task id) the event belongs to; null for the main session. */
+  agentId: string | null;
+}
+
+/**
+ * One subagent invocation inside a run, as stored in `run_agents`. The unit evals and
+ * metrics can judge below the run: its own brief, report, tools, model and tokens.
+ */
+export interface RunAgent extends SubagentRecord {
+  runId: string;
+  /** Short hash of `<project>/.claude/agents/<subagentType>.md` at start time; null for builtins. */
+  definitionHash: string | null;
 }
 
 /** Compact view used by list_runs. */

@@ -14,6 +14,7 @@ export {
   deleteAgentFile,
   agentToSpec,
   listProjectAgents,
+  projectAgentDefinitionHash,
   agentKind,
   assertAgentKind,
   type AgentKind,
