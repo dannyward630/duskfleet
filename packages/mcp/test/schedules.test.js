@@ -160,3 +160,51 @@ test("tick fires due schedules, honours the kill switch, and only the lease hold
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a run request (dashboard 'Run now') is fired by the lease holder on its next tick, even when paused, and cleared", async () => {
+  const { root, configDir } = makeRoot();
+  const config = loadConfig(configDir);
+  const db = openDatabase(config.dataDir);
+  const runs = new RunManager(config, new RunRepository(db), new ClaudeCodeExecutor({ binary: config.claude.binary, strictMcpConfig: true, allowBypassPermissions: false }));
+  const repo = new ScheduleRepository(db);
+  const a = new Scheduler(repo, runs, { tickMs: 1000, holder: "A" });
+  const b = new Scheduler(repo, runs, { tickMs: 1000, holder: "B" });
+  try {
+    const s = a.create({ name: "paused one", agentId: "coder", prompt: "ok", cron: "0 3 * * *", enabled: false });
+    assert.equal(s.runRequestedAt, null);
+
+    // the request is a timestamp on the row, idempotent
+    const requested = repo.requestRun(s.id);
+    assert.ok(requested.runRequestedAt);
+    assert.equal(repo.requestRun(s.id).runRequestedAt, requested.runRequestedAt, "second request keeps the first timestamp");
+    assert.equal(repo.requestRun("nope"), null);
+
+    // a non-holder does not consume it
+    await a.tick(); // A takes the lease first...
+    assert.equal(a.status().leaseHeldByThisProcess, true);
+    let after = repo.get(s.id);
+    assert.equal(after.lastOutcome, "started", "fired although paused");
+    assert.equal(after.runRequestedAt, null, "request cleared");
+    assert.equal(after.enabled, false, "still paused");
+    assert.equal(after.nextRunAt, null, "a paused schedule gets no next tick");
+    assert.equal(runs.getRun(after.lastRunId).scheduleId, s.id);
+
+    // while that run is busy, a new request is a skip, and B (no lease) leaves it alone
+    repo.requestRun(s.id);
+    await b.tick();
+    assert.ok(repo.get(s.id).runRequestedAt, "B did not consume the request");
+    await a.tick();
+    after = repo.get(s.id);
+    assert.equal(after.lastOutcome, "skipped_busy");
+    assert.equal(after.runRequestedAt, null);
+    assert.equal(repo.firings(s.id).length, 2);
+    await runs.waitForRun(after.lastRunId, 10_000);
+  } finally {
+    a.stop();
+    b.stop();
+    runs.shutdown();
+    await new Promise((r) => setTimeout(r, 300));
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

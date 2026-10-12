@@ -9,6 +9,8 @@
  *    throw; the firing is recorded as `skipped_busy`.
  *  - Only one process ticks: the SQLite lease (see ScheduleRepository) is renewed
  *    every tick and expires after 3 ticks without renewal.
+ *  - A process without a RunManager (the dashboard) triggers a schedule by setting
+ *    `run_requested_at`; the lease holder fires it on its next tick, paused or not.
  */
 import { hostname } from "node:os";
 import type { RunManager } from "../orchestration/run-manager.js";
@@ -138,6 +140,11 @@ export class Scheduler {
       this.leaseHeld = this.repo.acquireLease(this.holder, this.tickMs * 3);
       if (!this.leaseHeld) return;
 
+      // Manual "run now" requests (dashboard) first: they fire even when paused, like fireNow.
+      for (const s of this.repo.takeRunRequests()) {
+        log.info("run requested", { schedule: s.name, requestedAt: s.runRequestedAt });
+        await this.fire(s, true);
+      }
       for (const s of this.repo.due(this.now().toISOString())) {
         await this.fire(s, false);
       }

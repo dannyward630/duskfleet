@@ -2,15 +2,31 @@
 
 import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
-import { deleteScheduleAction, setScheduleEnabledAction, updateScheduleWhenAction, type ActionResult } from "@/app/schedules/actions";
+import { deleteScheduleAction, requestScheduleRunAction, setScheduleEnabledAction, updateScheduleWhenAction, type ActionResult } from "@/app/schedules/actions";
 
 /**
- * Inline controls for one schedule: pause / resume, edit when it fires
+ * Inline controls for one schedule: run now (a request the ticking process
+ * fires on its next tick, paused or not), pause / resume, edit when it fires
  * (cron + time zone, validated server-side by the same code as update_schedule)
  * and delete with a two-step confirmation. No browser dialogs; the result is
  * shown in place.
  */
-export function ScheduleActions({ id, name, enabled, cron, timeZone }: { id: string; name: string; enabled: boolean; cron: string; timeZone: string }) {
+export function ScheduleActions({
+  id,
+  name,
+  enabled,
+  cron,
+  timeZone,
+  runRequested,
+}: {
+  id: string;
+  name: string;
+  enabled: boolean;
+  cron: string;
+  timeZone: string;
+  /** A "run now" is already waiting for the next tick. */
+  runRequested: boolean;
+}) {
   const router = useRouter();
   const [pending, start] = useTransition();
   const [mode, setMode] = useState<"idle" | "edit" | "confirm-delete">("idle");
@@ -88,6 +104,19 @@ export function ScheduleActions({ id, name, enabled, cron, timeZone }: { id: str
         </>
       ) : (
         <>
+          <button
+            type="button"
+            className="copy-btn"
+            disabled={pending || runRequested}
+            title={
+              runRequested
+                ? "Already requested: the ticking process starts it on its next tick"
+                : "Fire once now, outside the cron and even when paused. Same busy rules as a tick; it starts on the next tick of the process that holds the lease."
+            }
+            onClick={() => apply(() => requestScheduleRunAction(id))}
+          >
+            {pending ? "…" : runRequested ? "Run requested" : "Run now"}
+          </button>
           <button
             type="button"
             className="copy-btn"

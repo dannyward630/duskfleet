@@ -66,5 +66,10 @@ Things to know:
 - Missed ticks (nobody running) are not caught up.
 - `scheduler.enabled: false` in `duskfleet.yaml` is the kill switch, re-read every tick.
 - Every run started by a schedule carries its `scheduleId`.
-- New schedules are best created paused (`enabled: false`), tried once with `run_schedule_now`,
-  checked on the dashboard (denials, missing MCP servers, cost) and only then enabled.
+- New schedules are best created paused (`enabled: false`), tried once with `run_schedule_now`
+  or the dashboard's **Run now**, checked on the dashboard (denials, missing MCP servers, cost)
+  and only then enabled.
+- Two ways to fire a schedule by hand, both outside its cron and even when paused:
+  `run_schedule_now` over MCP starts the run immediately in the MCP server process;
+  **Run now** on the dashboard sets `run_requested_at` on the row and the lease holder fires it
+  on its next tick (the dashboard never spawns Claude). Both follow the busy rules of a tick.

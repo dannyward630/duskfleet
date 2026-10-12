@@ -156,6 +156,12 @@ const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
       ALTER TABLE run_events ADD COLUMN agent_id TEXT;
     `,
   },
+  {
+    // "Run now" from a process that does not run agents (the dashboard): the request is a
+    // timestamp on the row, consumed by whichever process holds the scheduler lease on its next tick.
+    version: 6,
+    sql: `ALTER TABLE schedules ADD COLUMN run_requested_at TEXT;`,
+  },
 ];
 
 export function openDatabase(dataDir: string): DatabaseSync {

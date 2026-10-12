@@ -26,6 +26,7 @@ interface ScheduleRow {
   last_run_id: string | null;
   fires: number;
   skips: number;
+  run_requested_at: string | null;
 }
 
 function rowToSchedule(r: ScheduleRow): Schedule {
@@ -48,6 +49,7 @@ function rowToSchedule(r: ScheduleRow): Schedule {
     lastRunId: r.last_run_id,
     fires: r.fires,
     skips: r.skips,
+    runRequestedAt: r.run_requested_at ?? null,
   };
 }
 
@@ -125,6 +127,24 @@ export class ScheduleRepository {
     values.push(id);
     this.db.prepare(`UPDATE schedules SET ${sets.join(", ")} WHERE id = ?`).run(...values);
     return this.get(id)!;
+  }
+
+  /**
+   * Ask the ticking process to fire this schedule on its next tick (manual trigger from a
+   * process without a RunManager, e.g. the dashboard). Idempotent: a second request before
+   * the tick keeps the first timestamp. Returns null when the schedule does not exist.
+   */
+  requestRun(id: string): Schedule | null {
+    const now = new Date().toISOString();
+    this.db.prepare("UPDATE schedules SET run_requested_at = COALESCE(run_requested_at, ?) WHERE id = ?").run(now, id);
+    return this.get(id);
+  }
+
+  /** Schedules with a pending run request, cleared in the same call so a crash cannot loop on them. */
+  takeRunRequests(): Schedule[] {
+    const rows = (this.db.prepare("SELECT * FROM schedules WHERE run_requested_at IS NOT NULL ORDER BY run_requested_at").all() as unknown as ScheduleRow[]).map(rowToSchedule);
+    if (rows.length > 0) this.db.prepare("UPDATE schedules SET run_requested_at = NULL WHERE run_requested_at IS NOT NULL").run();
+    return rows;
   }
 
   delete(id: string): boolean {

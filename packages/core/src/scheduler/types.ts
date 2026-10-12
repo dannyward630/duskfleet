@@ -31,6 +31,11 @@ export interface Schedule {
   /** Counters since creation. */
   fires: number;
   skips: number;
+  /**
+   * Set by `ScheduleRepository.requestRun` (dashboard "Run now"); the lease holder fires the
+   * schedule on its next tick, outside its cron and even when paused, and clears it.
+   */
+  runRequestedAt: string | null;
 }
 
 export interface ScheduleInput {
