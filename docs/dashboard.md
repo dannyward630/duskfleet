@@ -26,9 +26,11 @@ in the nav); the other pages are static.
   past 4 entries), limits, prompt preview and aggregate stats. User agents can be deleted or
   unlinked from here, with an inline confirmation; builtins are read-only.
 - **Schedules**: state, cron (human and raw), next tick (theoretical one for paused schedules),
-  last outcome and firing history. Each row can be paused / resumed, have its cron and time
-  zone edited, or be deleted (inline confirmation); the changes go through the same validation
-  as `update_schedule`. The badge says which kind of process ticks (service, MCP host) and
+  last outcome and firing history. Each row can be run now, paused / resumed, have its cron and
+  time zone edited, or be deleted (inline confirmation); the changes go through the same
+  validation as `update_schedule`. **Run now** does not start Claude from the dashboard: it marks
+  the row and the process that holds the scheduler lease fires it on its next tick (within
+  `tick_seconds`, paused or not, busy = skip), so it waits while no process ticks. The badge says which kind of process ticks (service, MCP host) and
   warns when only an MCP host does, with the `install-service` command. Creating a schedule and
   changing its agent, project, prompt or model stay on MCP (copyable `create_schedule` example).
 - **MCP**: the tool catalogue (`packages/mcp/dist/tools.json`, generated at build time from the

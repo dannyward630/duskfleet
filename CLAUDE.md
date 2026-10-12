@@ -39,8 +39,9 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
 - `apps/web` (`@duskfleet/web`): Next.js 15 dashboard. Reads the DB the server writes (WAL
   mode). Never mutates runs or builtins; its only writes are server actions on user agent
   files (`app/agents/actions.ts`: delete, unlink) and on schedule rows
-  (`app/schedules/actions.ts`: pause/resume, cron + time zone, delete, through core's
-  `updateSchedule`). No auth, localhost only.
+  (`app/schedules/actions.ts`: pause/resume, cron + time zone, delete, run now, through core's
+  `updateSchedule` / `requestRun`; run now only stamps `run_requested_at`, the lease holder
+  fires it on its next tick). No auth, localhost only.
 - `config/`: `duskfleet.yaml`, `agents/*.md` (builtin agents: YAML frontmatter + system
   prompt body), `projects.yaml` (repo-relative examples only). Meant to be committed.
   **This repo is public: no usernames, home paths or machine-specific values in versioned

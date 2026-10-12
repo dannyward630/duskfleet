@@ -53,7 +53,7 @@ export default function SchedulesPage() {
           >
             {enabled ? (leaseLive ? `ticking · ${holderLabel}` : "no process ticking") : "scheduler off"}
           </span>
-          <span>pause, resume, edit when, delete here · create over MCP, see below</span>
+          <span>run now, pause, resume, edit when, delete here · create over MCP, see below</span>
         </span>
       </div>
 
@@ -124,6 +124,13 @@ export default function SchedulesPage() {
                       {s.enabled ? "enabled" : "paused"}
                     </span>
                     {!s.enabled && <div className="faint" style={{ fontSize: "0.8rem", marginTop: 4 }} title={fmtTime(s.updatedAt)}>since {fmtRelative(s.updatedAt)}</div>}
+                    {s.runRequestedAt && (
+                      <div style={{ marginTop: 4 }}>
+                        <span className="badge pending" title={`Run requested ${fmtTime(s.runRequestedAt)}; the ticking process fires it on its next tick`}>
+                          run requested
+                        </span>
+                      </div>
+                    )}
                   </td>
                   <td className="what">
                     <div className="prompt" title={s.prompt}>{s.name}</div>
@@ -147,7 +154,7 @@ export default function SchedulesPage() {
                     <div className="muted" style={{ fontSize: "0.8rem", marginTop: 4, maxWidth: 520 }} title={s.prompt}>
                       {runTitle(s.prompt, 90)}
                     </div>
-                    <ScheduleActions id={s.id} name={s.name} enabled={s.enabled} cron={s.cron} timeZone={s.timeZone} />
+                    <ScheduleActions id={s.id} name={s.name} enabled={s.enabled} cron={s.cron} timeZone={s.timeZone} runRequested={s.runRequestedAt !== null} />
                   </td>
                   <td className="cron-cell">
                     <div>{s.cronHuman}</div>
@@ -200,10 +207,12 @@ export default function SchedulesPage() {
       <h2>Manage schedules</h2>
       <div className="card howto">
         <div className="muted" style={{ fontSize: "0.9rem" }}>
-          Each row has <strong>Pause / Resume</strong>, <strong>Edit when</strong> (cron and time zone) and <strong>Delete</strong>; they
-          apply the same validation as the MCP tools and whichever process ticks picks the change up on its next tick. Creating a schedule,
-          changing its agent, project, prompt or model, and firing it now still go through an MCP client (Claude Desktop, Claude Code):{" "}
-          <code>create_schedule</code>, <code>update_schedule</code>, <code>run_schedule_now</code>. The CLI lists them with{" "}
+          Each row has <strong>Run now</strong>, <strong>Pause / Resume</strong>, <strong>Edit when</strong> (cron and time zone) and{" "}
+          <strong>Delete</strong>; they apply the same validation as the MCP tools and whichever process ticks picks the change up on its next
+          tick. <strong>Run now</strong> fires once, outside the cron and even when paused, on the next tick of the process that holds the lease
+          (so nothing happens while no process ticks); a busy agent or project is a skip. Creating a schedule and changing its agent, project,
+          prompt or model still go through an MCP client (Claude Desktop, Claude Code): <code>create_schedule</code>,{" "}
+          <code>update_schedule</code>; <code>run_schedule_now</code> fires immediately from there. The CLI lists them with{" "}
           <code>npm run cli -- schedules</code>.
         </div>
         <div className="two-col">
