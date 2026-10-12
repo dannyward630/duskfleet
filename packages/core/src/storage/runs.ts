@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { DeniedTool, RunMcpInfo } from "../execution/types.js";
-import type { Run, RunEvent, RunStatus } from "../observability/run.js";
+import type { DeniedTool, RunMcpInfo, SubagentRecord, SubagentStatus } from "../execution/types.js";
+import type { Run, RunAgent, RunEvent, RunStatus } from "../observability/run.js";
 
 /** Row shape as SQLite returns it. */
 interface RunRow {
@@ -247,24 +247,133 @@ export class RunRepository {
     return (this.db.prepare("SELECT * FROM runs WHERE status = ?").all(status) as unknown as RunRow[]).map(rowToRun);
   }
 
-  addEvent(runId: string, type: RunEvent["type"], payload: unknown): void {
+  addEvent(runId: string, type: RunEvent["type"], payload: unknown, agentId: string | null = null): void {
     this.db
-      .prepare("INSERT INTO run_events (run_id, ts, type, payload) VALUES (?, ?, ?, ?)")
-      .run(runId, new Date().toISOString(), type, payload === undefined ? null : JSON.stringify(payload));
+      .prepare("INSERT INTO run_events (run_id, ts, type, payload, agent_id) VALUES (?, ?, ?, ?, ?)")
+      .run(runId, new Date().toISOString(), type, payload === undefined ? null : JSON.stringify(payload), agentId);
   }
 
   events(runId: string, limit = 200): RunEvent[] {
     const rows = this.db
-      .prepare("SELECT id, run_id, ts, type, payload FROM run_events WHERE run_id = ? ORDER BY id ASC LIMIT ?")
-      .all(runId, limit) as Array<{ id: number; run_id: string; ts: string; type: RunEvent["type"]; payload: string | null }>;
+      .prepare("SELECT id, run_id, ts, type, payload, agent_id FROM run_events WHERE run_id = ? ORDER BY id ASC LIMIT ?")
+      .all(runId, limit) as Array<{ id: number; run_id: string; ts: string; type: RunEvent["type"]; payload: string | null; agent_id: string | null }>;
     return rows.map((r) => ({
       id: r.id,
       runId: r.run_id,
       ts: r.ts,
       type: r.type,
       payload: r.payload === null ? null : JSON.parse(r.payload),
+      agentId: r.agent_id ?? null,
     }));
   }
+
+  /** Insert or refresh one subagent invocation. Idempotent on (run_id, agent_id). */
+  upsertAgent(runId: string, s: SubagentRecord, definitionHash: string | null): void {
+    this.db
+      .prepare(
+        `INSERT INTO run_agents (run_id, agent_id, parent_tool_use_id, parent_agent_id, subagent_type, description, prompt,
+           result_text, status, model, started_at, ended_at, duration_ms, tool_calls, tools_json,
+           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, total_tokens, definition_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (run_id, agent_id) DO UPDATE SET
+           parent_tool_use_id = excluded.parent_tool_use_id, parent_agent_id = excluded.parent_agent_id,
+           subagent_type = excluded.subagent_type, description = excluded.description,
+           prompt = COALESCE(excluded.prompt, run_agents.prompt), result_text = excluded.result_text,
+           status = excluded.status, model = excluded.model, ended_at = excluded.ended_at,
+           duration_ms = excluded.duration_ms, tool_calls = excluded.tool_calls, tools_json = excluded.tools_json,
+           input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
+           cache_read_tokens = excluded.cache_read_tokens, cache_creation_tokens = excluded.cache_creation_tokens,
+           total_tokens = excluded.total_tokens, started_at = excluded.started_at,
+           definition_hash = COALESCE(excluded.definition_hash, run_agents.definition_hash)`,
+      )
+      .run(
+        runId,
+        s.agentId,
+        s.parentToolUseId,
+        s.parentAgentId,
+        s.subagentType,
+        s.description,
+        s.prompt,
+        s.resultText,
+        s.status,
+        s.model,
+        s.startedAt,
+        s.endedAt,
+        s.durationMs,
+        s.toolCalls,
+        JSON.stringify(s.tools),
+        s.usage.inputTokens,
+        s.usage.outputTokens,
+        s.usage.cacheReadTokens,
+        s.usage.cacheCreationTokens,
+        s.totalTokens,
+        definitionHash,
+      );
+  }
+
+  /** Subagent invocations of a run, in start order. */
+  agents(runId: string): RunAgent[] {
+    return (this.db.prepare("SELECT * FROM run_agents WHERE run_id = ? ORDER BY id ASC").all(runId) as unknown as RunAgentRow[]).map(rowToRunAgent);
+  }
+}
+
+interface RunAgentRow {
+  run_id: string;
+  agent_id: string;
+  parent_tool_use_id: string | null;
+  parent_agent_id: string | null;
+  subagent_type: string;
+  description: string | null;
+  prompt: string | null;
+  result_text: string | null;
+  status: string;
+  model: string | null;
+  started_at: string;
+  ended_at: string | null;
+  duration_ms: number | null;
+  tool_calls: number;
+  tools_json: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+  total_tokens: number | null;
+  definition_hash: string | null;
+}
+
+function rowToRunAgent(r: RunAgentRow): RunAgent {
+  let tools: string[] = [];
+  try {
+    const v = JSON.parse(r.tools_json);
+    if (Array.isArray(v)) tools = v.filter((t): t is string => typeof t === "string");
+  } catch {
+    /* keep [] */
+  }
+  return {
+    runId: r.run_id,
+    agentId: r.agent_id,
+    parentToolUseId: r.parent_tool_use_id,
+    parentAgentId: r.parent_agent_id,
+    subagentType: r.subagent_type,
+    description: r.description,
+    prompt: r.prompt,
+    resultText: r.result_text,
+    status: r.status as SubagentStatus,
+    model: r.model,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+    durationMs: r.duration_ms,
+    toolCalls: r.tool_calls,
+    tools,
+    usage: {
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      cacheReadTokens: r.cache_read_tokens,
+      cacheCreationTokens: r.cache_creation_tokens,
+    },
+    totalTokens: r.total_tokens,
+    definitionHash: r.definition_hash,
+  };
 }
 
 function safeParse(json: string | null): DeniedTool[] {

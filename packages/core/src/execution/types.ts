@@ -29,13 +29,58 @@ export interface ExecutionRequest {
   logPath?: string;
 }
 
-/** Structured events emitted while the process runs. */
+/**
+ * Structured events emitted while the process runs. `agentId` is null for the main
+ * session and the Claude Code task id of the subagent that produced the message
+ * otherwise (see SubagentRecord).
+ */
 export type ExecutionEvent =
   | { type: "init"; sessionId: string; model: string | null; tools: string[]; mcpServers: McpServerInfo[]; cliVersion: string | null }
-  | { type: "tool_use"; name: string; id: string | null; input?: unknown }
-  | { type: "assistant_text"; text: string }
+  | { type: "tool_use"; name: string; id: string | null; input?: unknown; agentId: string | null }
+  | { type: "assistant_text"; text: string; agentId: string | null }
+  | { type: "subagent_start"; subagent: SubagentRecord }
+  | { type: "subagent_end"; subagent: SubagentRecord }
   | { type: "stderr"; text: string }
   | { type: "parse_error"; line: string };
+
+export type SubagentStatus = "running" | "completed" | "failed" | "interrupted";
+
+/**
+ * One subagent invocation inside a run: what the parent delegated (the Agent tool
+ * call), what came back, and what the subagent did in between. Built from Claude
+ * Code's `task_started` / `task_notification` system lines and from the `agent_id` /
+ * `parent_tool_use_id` fields every nested message carries (verified 2026-10-12).
+ */
+export interface SubagentRecord {
+  /** Claude Code task id; every message of this subagent carries it as `agent_id`. */
+  agentId: string;
+  /** Agent tool_use id in the parent that spawned it. */
+  parentToolUseId: string | null;
+  /** Subagent that issued the Agent call; null when it was the main session. */
+  parentAgentId: string | null;
+  /** The `subagent_type`: a project agent (`.claude/agents/<name>.md`) or a builtin such as `claude`. */
+  subagentType: string;
+  description: string | null;
+  /** The brief the parent gave. */
+  prompt: string | null;
+  /** The subagent's final report as handed back to the parent. */
+  resultText: string | null;
+  status: SubagentStatus;
+  model: string | null;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
+  toolCalls: number;
+  /** Distinct tool names, in first-use order. */
+  tools: string[];
+  /**
+   * Summed from the subagent's assistant lines. Cache figures are exact; `outputTokens`
+   * is a streaming snapshot and undercounts. Prefer `totalTokens` for cost estimates.
+   */
+  usage: TokenUsage;
+  /** Total tokens as reported by Claude Code's task_progress / task_notification lines. */
+  totalTokens: number | null;
+}
 
 export interface TokenUsage {
   inputTokens: number | null;
@@ -89,6 +134,8 @@ export interface ExecutionResult {
   contextExhausted: boolean;
   /** Full raw result object from the tool, for later analysis. */
   rawResult: unknown;
+  /** Subagent invocations observed in the stream, in start order. */
+  subagents: SubagentRecord[];
 }
 
 export interface ExecutionHandle {

@@ -105,6 +105,11 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
 - **Concurrency guards live in `RunManager.startRun`**: one run per project directory and
   one per agent by default (`max_concurrent_per_project`, `max_concurrent_per_agent`).
   Refuse, never queue; a scheduler must treat "busy" as "skip this tick".
+- **Subagents are rows, not prose** (`run_agents`, migration 5): the parser folds Claude Code's
+  `task_started` / `task_notification` lines and the `agent_id` of nested messages into one
+  `SubagentRecord` per Agent call; `RunManager` writes them on `subagent_start` / `subagent_end`
+  and marks the open ones `interrupted` when the run ends. Per-message `output_tokens` of nested
+  lines undercount; use `totalTokens`. Only main-session lines set the run's model and last text.
 - **`contextExhausted` is structured-only** (terminal reason / subtype / stop reason, or
   the error text of a failed run). Never scan a successful result's prose: it produced a
   false positive.

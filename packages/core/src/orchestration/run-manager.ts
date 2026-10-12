@@ -7,11 +7,11 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { loadConfig } from "../config/loader.js";
-import { listProjectAgents } from "../config/agent-files.js";
+import { listProjectAgents, projectAgentDefinitionHash } from "../config/agent-files.js";
 import { summarizeToolInput } from "./tool-summary.js";
 import type { AgentDefinition, DuskFleetConfig, ProjectDefinition } from "../config/types.js";
-import type { ExecutionEvent, ExecutionHandle, ExecutionRequest, ExecutionResult, Executor, McpServerInfo } from "../execution/types.js";
-import { isTerminal, type Run, type RunStatus } from "../observability/run.js";
+import type { ExecutionEvent, ExecutionHandle, ExecutionRequest, ExecutionResult, Executor, McpServerInfo, SubagentRecord } from "../execution/types.js";
+import { isTerminal, type Run, type RunAgent, type RunStatus } from "../observability/run.js";
 import type { RunRepository, ListRunsFilter } from "../storage/runs.js";
 import { logger } from "../util/log.js";
 import { validateProjectPath } from "./project-validation.js";
@@ -37,6 +37,19 @@ interface ActiveRun {
   allowedTools: string[];
   mounted: McpServerInfo[];
   usedServers: Set<string>;
+}
+
+/** Event payload for a subagent start/end: enough to read the timeline without the row. */
+function summarizeSubagent(s: SubagentRecord) {
+  return {
+    subagentType: s.subagentType,
+    description: s.description,
+    parentAgentId: s.parentAgentId,
+    status: s.status,
+    model: s.model,
+    toolCalls: s.toolCalls,
+    durationMs: s.durationMs,
+  };
 }
 
 /** Claude Code derives MCP tool prefixes from the server name: "claude.ai Figma" → "mcp__claude_ai_Figma". */
@@ -104,6 +117,11 @@ export class RunManager {
 
   events(runId: string) {
     return this.runs.events(runId);
+  }
+
+  /** Subagent invocations recorded for a run (see RunAgent). */
+  agents(runId: string): RunAgent[] {
+    return this.runs.agents(runId);
   }
 
   /**
@@ -296,6 +314,15 @@ export class RunManager {
           message: `allow-listed MCP servers never mounted in this run: ${mcp.allowListedMissing.join(", ")} (mounted: ${mcp.mounted.map((m) => mcpToolPrefix(m.name)).join(", ") || "none reported"})`,
         });
       }
+      // Subagents still open when the process ended (cancel, timeout, crash) never handed back.
+      for (const s of result.subagents) {
+        if (s.endedAt !== null) continue;
+        s.status = "interrupted";
+        s.endedAt = result.endedAt;
+        s.durationMs = Math.max(0, Date.parse(result.endedAt) - Date.parse(s.startedAt));
+        this.runs.upsertAgent(runId, s, null);
+        this.runs.addEvent(runId, "subagent_end", summarizeSubagent(s), s.agentId);
+      }
       const current = this.runs.get(runId);
       if (!current) return;
       if (isTerminal(current.status)) {
@@ -410,7 +437,21 @@ export class RunManager {
       case "tool_use": {
         const m = /^(mcp__[^_].*?)__/.exec(event.name);
         if (m) this.active.get(runId)?.usedServers.add(m[1]!);
-        this.runs.addEvent(runId, "tool_use", { name: event.name, summary: summarizeToolInput(event.name, event.input) });
+        this.runs.addEvent(runId, "tool_use", { name: event.name, summary: summarizeToolInput(event.name, event.input) }, event.agentId);
+        break;
+      }
+      case "subagent_start": {
+        const s = event.subagent;
+        const projectPath = this.active.get(runId)?.projectPath;
+        const hash = projectPath ? projectAgentDefinitionHash(projectPath, s.subagentType) : null;
+        this.runs.upsertAgent(runId, s, hash);
+        this.runs.addEvent(runId, "subagent_start", summarizeSubagent(s), s.agentId);
+        break;
+      }
+      case "subagent_end": {
+        const s = event.subagent;
+        this.runs.upsertAgent(runId, s, null);
+        this.runs.addEvent(runId, "subagent_end", summarizeSubagent(s), s.agentId);
         break;
       }
       case "parse_error":

@@ -149,6 +149,80 @@ test("cancel_run stops a running process", async () => {
   }
 });
 
+test("subagent invocations are recorded as run_agents rows with the persona hash", async () => {
+  const app = makeApp();
+  try {
+    mkdirSync(path.join(app.project, ".claude", "agents"), { recursive: true });
+    writeFileSync(path.join(app.project, ".claude", "agents", "reviewer.md"), `---\ndescription: Reviews diffs\ntools: Bash, Read\n---\nReview.\n`);
+    const started = await app.runs.startRun({ prompt: "subagent", projectPath: app.project, model: "opus" });
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.equal(run.status, "completed");
+    assert.equal(run.modelUsed, "opus", "the subagent's haiku must not become the run model");
+    assert.equal(run.resultText, "Reviewer found two issues.");
+    assert.equal(run.toolCalls, 3, "Agent call + two subagent tool calls");
+
+    const subagents = app.runs.agents(run.id);
+    assert.equal(subagents.length, 1);
+    const [s] = subagents;
+    assert.equal(s.runId, run.id);
+    assert.equal(s.subagentType, "reviewer");
+    assert.equal(s.description, "Review the diff");
+    assert.equal(s.prompt, "Review the diff and report problems. Do not edit files.");
+    assert.equal(s.resultText, "[Subagent hand-back] Two findings: x is unused; y lacks a test.");
+    assert.equal(s.status, "completed");
+    assert.equal(s.model, "claude-haiku-5-5");
+    assert.equal(s.parentAgentId, null);
+    assert.equal(s.parentToolUseId, "toolu_agent_1");
+    assert.equal(s.toolCalls, 2);
+    assert.deepEqual(s.tools, ["Bash", "Read"]);
+    assert.deepEqual(s.usage, { inputTokens: 5, outputTokens: 60, cacheReadTokens: 500, cacheCreationTokens: 300 });
+    assert.equal(s.totalTokens, 865, "from task_notification");
+    assert.equal(s.durationMs, 4500);
+    assert.equal(s.startedAt, "2026-10-12T20:27:46.000Z", "first nested message's timestamp");
+    assert.equal(s.endedAt, "2026-10-12T20:27:50.000Z");
+    assert.match(s.definitionHash, /^[0-9a-f]{12}$/, "hash of .claude/agents/reviewer.md");
+
+    const events = app.runs.events(run.id);
+    assert.deepEqual(
+      events.map((e) => [e.type, e.agentId]),
+      [
+        ["status_change", null],
+        ["status_change", null],
+        ["init", null],
+        ["tool_use", null],
+        ["subagent_start", "a6b73b2ad14bf09f8"],
+        ["tool_use", "a6b73b2ad14bf09f8"],
+        ["tool_use", "a6b73b2ad14bf09f8"],
+        ["subagent_end", "a6b73b2ad14bf09f8"],
+        ["status_change", null],
+      ],
+    );
+    assert.equal(events[7].payload.status, "completed");
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("a subagent still open when the run is cancelled is recorded as interrupted", async () => {
+  const app = makeApp();
+  try {
+    const started = await app.runs.startRun({ prompt: "subagent-hang", projectPath: app.project });
+    await new Promise((r) => setTimeout(r, 500));
+    app.runs.cancelRun(started.id);
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.equal(run.status, "cancelled");
+    const [s] = app.runs.agents(run.id);
+    assert.equal(s.subagentType, "reviewer");
+    assert.equal(s.status, "interrupted");
+    assert.equal(s.endedAt, run.endedAt);
+    assert.equal(s.toolCalls, 2);
+    assert.equal(s.definitionHash, null, "no .claude/agents/reviewer.md in this project");
+    assert.equal(app.runs.events(run.id).filter((e) => e.type === "subagent_end").length, 1);
+  } finally {
+    await app.cleanup();
+  }
+});
+
 test("project validation rejects paths outside allowed roots", async () => {
   const app = makeApp();
   try {

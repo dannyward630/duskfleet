@@ -122,6 +122,40 @@ const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
       ALTER TABLE runs ADD COLUMN schedule_id TEXT;
     `,
   },
+  {
+    // Subagent invocations: one row per Agent tool call observed in the stream (see SubagentRecord).
+    version: 5,
+    sql: `
+      CREATE TABLE IF NOT EXISTS run_agents (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id                TEXT NOT NULL REFERENCES runs(id),
+        agent_id              TEXT NOT NULL,
+        parent_tool_use_id    TEXT,
+        parent_agent_id       TEXT,
+        subagent_type         TEXT NOT NULL,
+        description           TEXT,
+        prompt                TEXT,
+        result_text           TEXT,
+        status                TEXT NOT NULL,
+        model                 TEXT,
+        started_at            TEXT NOT NULL,
+        ended_at              TEXT,
+        duration_ms           INTEGER,
+        tool_calls            INTEGER NOT NULL DEFAULT 0,
+        tools_json            TEXT NOT NULL DEFAULT '[]',
+        input_tokens          INTEGER,
+        output_tokens         INTEGER,
+        cache_read_tokens     INTEGER,
+        cache_creation_tokens INTEGER,
+        total_tokens          INTEGER,
+        definition_hash       TEXT,
+        UNIQUE (run_id, agent_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_agents_run ON run_agents(run_id);
+      CREATE INDEX IF NOT EXISTS idx_run_agents_type ON run_agents(subagent_type);
+      ALTER TABLE run_events ADD COLUMN agent_id TEXT;
+    `,
+  },
 ];
 
 export function openDatabase(dataDir: string): DatabaseSync {

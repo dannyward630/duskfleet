@@ -55,6 +55,18 @@ Probed with `claude -p ... --output-format stream-json --verbose`:
 The `result` line is the authoritative source for cost, tokens, turns and termination reason.
 `permission_denials` is our signal for "human intervention would have been required".
 
+Subagent lines (verified 2026-10-12 on a run that delegated twice):
+
+- `{"type":"system","subtype":"task_started","task_id":…,"tool_use_id":…,"description":…,"subagent_type":…,"prompt":…,"spawn_depth":n}`
+- every message produced inside the subagent carries `"agent_id":<task_id>`, `"parent_tool_use_id":<Agent tool_use id>`, `"subagent_type"`, `"task_description"` and a `"timestamp"`; the main session has `"parent_tool_use_id":null`
+- `{"type":"system","subtype":"task_progress"|"task_notification","task_id":…,"status":…,"summary":…,"usage":{"total_tokens":n,"tool_uses":n,"duration_ms":n}}`
+- the parent then receives a normal `tool_result` for the Agent call: the hand-back, with the report as text blocks
+
+The parser folds these into one `SubagentRecord` per invocation (`execution/types.ts`). The per-message
+`usage.output_tokens` of nested assistant lines is a streaming snapshot and undercounts; `total_tokens`
+from the task lines is the figure to use. One API response is streamed as several `assistant` lines
+sharing `message.id`; usage is counted once per id.
+
 ---
 
 ## 2. Architecture
@@ -171,8 +183,26 @@ CREATE TABLE run_events (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id    TEXT NOT NULL REFERENCES runs(id),
   ts        TEXT NOT NULL,
-  type      TEXT NOT NULL,       -- status_change | init | tool_use | error
-  payload   TEXT                 -- JSON
+  type      TEXT NOT NULL,       -- status_change | init | tool_use | error | note | subagent_start | subagent_end
+  payload   TEXT,                -- JSON
+  agent_id  TEXT                 -- subagent the event belongs to; NULL = main session (migration 5)
+);
+
+CREATE TABLE run_agents (         -- one row per subagent invocation (migration 5)
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id             TEXT NOT NULL REFERENCES runs(id),
+  agent_id           TEXT NOT NULL,       -- Claude Code task id
+  parent_tool_use_id TEXT,                -- the Agent call that spawned it
+  parent_agent_id    TEXT,                -- NULL = spawned by the main session
+  subagent_type      TEXT NOT NULL,       -- .claude/agents/<name>.md or a builtin
+  description        TEXT, prompt TEXT, result_text TEXT,
+  status             TEXT NOT NULL,       -- running | completed | failed | interrupted
+  model              TEXT, started_at TEXT NOT NULL, ended_at TEXT, duration_ms INTEGER,
+  tool_calls         INTEGER NOT NULL DEFAULT 0, tools_json TEXT NOT NULL DEFAULT '[]',
+  input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
+  total_tokens       INTEGER,             -- from task_notification; the reliable figure
+  definition_hash    TEXT,                -- sha256 prefix of the project agent file at start
+  UNIQUE (run_id, agent_id)
 );
 
 CREATE TABLE evals (              -- foundations only; nothing writes here in the MVP
@@ -257,7 +287,8 @@ Future: `scheduled` (before `pending`) once the scheduler exists.
 
 - **Scheduling**: implemented 2026-10-10 as in-process ticks over a `schedules` table (not YAML: schedules are created over MCP and carry runtime state). Cron parser in `scheduler/cron.ts`, engine in `scheduler/scheduler.ts`, create/update validation shared by MCP, CLI and dashboard in `scheduler/crud.ts`, lease in `storage/schedules.ts` so the MCP server and `duskfleet serve` never double-fire. Per-agent / per-project WIP guards live in `RunManager`.
 - **Unattended scheduling** (2026-10-12): the lease holder is `<role>@host:pid` (`serve`, `mcp`, `cli`) so the dashboard and `doctor` can say who ticks. `duskfleet install-service` (`packages/mcp/src/service.ts`) registers `serve` as a per-user service: launchd LaunchAgent on macOS, systemd user unit on Linux, Task Scheduler logon task (XML import, no time limit, restart on failure) on Windows. Rejected alternative: the OS crontab, which would duplicate schedules outside the DB, lose the lease / busy / kill-switch semantics, and run with a minimal environment without the user's `claude` login; a one-minute cron tick also cannot own the long-lived child processes. The unit embeds machine paths and is never versioned; Windows is implemented but unverified. The dashboard's Schedules page can pause / resume, edit cron + time zone and delete (server actions on core), create stays on MCP.
-- **Evals**: table and types exist; no evaluators. Planned: deterministic evaluators (`tests_passed`, `build_passed`, `files_exist`) run as post-run hooks defined in `config/evals/*.yaml`; LLM evaluators as a second Claude Code run in read-only mode.
+- **Subagent tracking**: implemented 2026-10-12. Every Agent call inside a run becomes a `run_agents` row (brief, report, tools, model, tokens, persona hash), exposed by `get_run` and `run-info`. Next: the tree on the dashboard run page, a per-project-agent page with history across runs, and a static preflight in `startRun` that compares every `.claude/agents/*.md` `tools:` list with what the run will mount (refuse `mcp__plugin_*`, servers missing from the allow-list) before paying for a run.
+- **Evals**: table and types exist; no evaluators. Planned: deterministic evaluators (`tests_passed`, `build_passed`, `files_exist`) run as post-run hooks defined in `config/evals/*.yaml`; LLM evaluators as a second Claude Code run in read-only mode. With `run_agents` the unit an LLM eval judges can be a single subagent invocation (its brief vs its report), and metrics can aggregate by `subagent_type`.
 - **Retries**, run queues and concurrency limits beyond a simple `max_concurrent_runs`.
 - **Metrics / reporting tools** (`compare_models`, `cost_report`) once there is data worth querying.
 - **Hook-based intervention detection** via `--include-hook-events`.

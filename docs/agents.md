@@ -122,3 +122,27 @@ connector (what runs see). Every run records what was mounted and which servers 
 actually called (`get_run` → `mcp`, dashboard → Technical details). An allow-list entry
 whose server never mounted is reported as `mcp.allowListedMissing`, flags the run as
 **needs review** and adds a note event, instead of failing silently.
+
+## Subagents inside runs
+
+A project agent usually delegates: a coordinator spawns a designer, a reviewer, a tester
+through Claude Code's `Agent` tool. DuskFleet records every such invocation as its own row
+(`run_agents`, migration 5), so the unit you can judge is not only the run but each agent
+that did part of the work:
+
+- `subagentType` (the `.claude/agents/<name>.md` it ran as, or a builtin such as `claude`),
+  `description`, the **brief** the parent gave (`prompt`) and the **report** it handed back
+  (`resultText`);
+- `status` (`completed`, `failed`, or `interrupted` when the run ended first), `model`,
+  timings, `toolCalls` and the distinct `tools` it used, token figures (`totalTokens` is the
+  reliable one), `parentAgentId` for nested delegation;
+- `definitionHash`: a short hash of the project agent file at start time, so evals can tell
+  which version of a persona produced a result.
+
+`get_run` returns them as `subagents`; `run-info` on the CLI does the same. Tool-use
+events in the timeline carry the `agentId` they belong to (null for the main session).
+Nothing is spawned differently: the data comes from the `task_started` /
+`task_notification` lines and the `agent_id` field of nested messages in Claude Code's
+stream, so it works for `own` and `link` agents alike. Remember that a subagent's own
+`tools:` list is a hard filter: a name that does not exist in the run (for instance a
+`mcp__plugin_*` prefix) leaves it without that tool, and only the recorded row shows it.

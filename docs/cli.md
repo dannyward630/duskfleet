@@ -9,7 +9,7 @@ npm run cli -- run --project ~/Documents/Projects/my-app -- "Add a README sectio
 npm run cli -- run --project-id my-app --agent my-reviewer --model sonnet -- "Review src/ for obvious bugs"
 npm run cli -- run --no-wait --project /path -- "..."     # return immediately
 npm run cli -- runs --status completed --limit 10
-npm run cli -- run-info <run_id> --events
+npm run cli -- run-info <run_id> --events   # includes subagents; --events adds the timeline
 npm run cli -- agents
 npm run cli -- projects
 npm run cli -- schedules
