@@ -10,13 +10,18 @@
  *   duskfleet run-info <run_id> [--events]
  *   duskfleet schedules
  *   duskfleet tools            # MCP tool catalogue (names, descriptions, input schemas)
- *   duskfleet serve            # long-running scheduler process (launchd/cron host)
- *   duskfleet doctor
+ *   duskfleet serve            # long-running scheduler process (what the service runs)
+ *   duskfleet install-service [--print]   # register `serve` with launchd / systemd --user / Task Scheduler
+ *   duskfleet uninstall-service
+ *   duskfleet doctor           # also reports the service and who holds the scheduler lease
  */
 import { parseArgs } from "node:util";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { bootstrap } from "./bootstrap.js";
 import { buildToolCatalog } from "./tools-catalog.js";
-import { summarizeRun } from "@duskfleet/core";
+import { installService, renderService, serviceStatus, uninstallService, type ServiceTarget } from "./service.js";
+import { findRepoRoot, parseHolder, summarizeRun } from "@duskfleet/core";
 import { RUN_STATUSES, type RunStatus } from "@duskfleet/core";
 
 function print(value: unknown): void {
@@ -35,11 +40,27 @@ function usage(): never {
       "  duskfleet schedules",
       "  duskfleet tools",
       "  duskfleet serve",
+      "  duskfleet install-service [--print]",
+      "  duskfleet uninstall-service",
       "  duskfleet doctor",
       "",
     ].join("\n"),
   );
   process.exit(2);
+}
+
+/** What the service runs: this node, this dist/cli.js, this repo, the resolved claude binary. */
+function serviceTarget(claudeBin: string | null, dataDir: string): ServiceTarget {
+  const cliEntry = fileURLToPath(import.meta.url);
+  const repoRoot = findRepoRoot(cliEntry) ?? path.resolve(path.dirname(cliEntry), "..", "..", "..");
+  return {
+    platform: process.platform,
+    repoRoot,
+    nodeBin: process.execPath,
+    cliEntry,
+    logPath: path.join(dataDir, "logs", "serve.log"),
+    claudeBin,
+  };
 }
 
 async function main(): Promise<void> {
@@ -50,13 +71,33 @@ async function main(): Promise<void> {
     return;
   }
 
-  const app = await bootstrap(import.meta.url);
+  const app = await bootstrap(import.meta.url, { role: command === "serve" ? "serve" : "cli" });
   const done = (code = 0) => {
     app.close();
     process.exit(code);
   };
 
   switch (command) {
+    case "install-service": {
+      const { values } = parseArgs({ args: rest, options: { print: { type: "boolean", default: false } } });
+      const target = serviceTarget(app.executor.binary, app.config.dataDir);
+      if (values.print) {
+        const unit = renderService(target);
+        process.stderr.write(`# ${unit.unitPath}\n`);
+        process.stdout.write(unit.content);
+        process.stderr.write(`\n# install: ${unit.installCommands.join(" && ")}\n`);
+        return done();
+      }
+      const { unit, ran } = installService(target);
+      const status = serviceStatus(process.platform);
+      print({ installed: true, platform: unit.platform, label: unit.label, unitPath: unit.unitPath, logPath: target.logPath, ran, status, notes: unit.notes });
+      return done(status.running === false ? 1 : 0);
+    }
+    case "uninstall-service": {
+      const r = uninstallService(process.platform);
+      print({ uninstalled: true, ...r });
+      return done();
+    }
     case "agents": {
       print([...app.config.agents.values()].map(({ systemPrompt: _p, ...a }) => a));
       return done();
@@ -73,6 +114,23 @@ async function main(): Promise<void> {
       } catch (err) {
         error = String(err);
       }
+      const service = serviceStatus(process.platform);
+      const lease = app.scheduler.status().lease;
+      const leaseLive = lease ? new Date(lease.expiresAt).getTime() > Date.now() : false;
+      const holder = lease && leaseLive ? parseHolder(lease.holder) : null;
+      const scheduler = {
+        enabled: app.config.scheduler.enabled,
+        ticking: leaseLive,
+        holder: holder ? { role: holder.role, host: holder.host, pid: holder.pid, expiresAt: lease!.expiresAt } : null,
+        service,
+        advice: !app.config.scheduler.enabled
+          ? "scheduler.enabled is false in duskfleet.yaml: nothing fires"
+          : service.running
+            ? null
+            : service.supported
+              ? `schedules fire only while an MCP host keeps the server alive${leaseLive ? "" : " (nothing is ticking right now)"}; run "duskfleet install-service" to run them unattended`
+              : service.detail,
+      };
       print({
         node: process.version,
         claudeBinary: app.executor.binary,
@@ -81,6 +139,7 @@ async function main(): Promise<void> {
         configDir: app.config.configDir,
         dataDir: app.config.dataDir,
         agents: [...app.config.agents.keys()],
+        scheduler,
       });
       return done(error ? 1 : 0);
     }

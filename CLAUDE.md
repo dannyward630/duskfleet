@@ -15,7 +15,8 @@ npm run build        # core + mcp (tsc). Run after every change under packages/:
 npm run typecheck    # core + mcp;  web: npm run typecheck -w @duskfleet/web
 npm test             # packages/mcp/test/*.test.js, node --test, ~25 s, no network, no cost
 npm run cli -- doctor | agents | projects | run | runs | run-info | schedules
-npm run cli -- serve  # long-running scheduler process (launchd); the MCP server also ticks
+npm run cli -- serve  # long-running scheduler process; the MCP server also ticks
+npm run cli -- install-service [--print] | uninstall-service   # register `serve` with launchd / systemd --user / Task Scheduler
 npm run cli -- run --project <abs path> --agent <agent id> --model haiku -- "task"
 npm run web          # Next.js dashboard, http://localhost:4777
 ```
@@ -37,7 +38,9 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
   `src/mcp/tools/`; register it in `src/mcp/server.ts`.
 - `apps/web` (`@duskfleet/web`): Next.js 15 dashboard. Reads the DB the server writes (WAL
   mode). Never mutates runs or builtins; its only writes are server actions on user agent
-  files (`app/agents/actions.ts`: delete, unlink). No auth, localhost only.
+  files (`app/agents/actions.ts`: delete, unlink) and on schedule rows
+  (`app/schedules/actions.ts`: pause/resume, cron + time zone, delete, through core's
+  `updateSchedule`). No auth, localhost only.
 - `config/`: `duskfleet.yaml`, `agents/*.md` (builtin agents: YAML frontmatter + system
   prompt body), `projects.yaml` (repo-relative examples only). Meant to be committed.
   **This repo is public: no usernames, home paths or machine-specific values in versioned
@@ -56,8 +59,13 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
 
 - Scheduler (`packages/core/src/scheduler/`): schedules are DB rows (migration 4), cron is the
   in-house 5-field parser in `cron.ts` (no dependency; DST-safe by re-deriving local time per
-  candidate minute). Only the SQLite lease holder ticks. Busy = `skipped_busy`, never a queue;
+  candidate minute). Only the SQLite lease holder ticks; the holder is `<role>@host:pid`
+  (`serve` / `mcp` / `cli`, `parseHolder`). Busy = `skipped_busy`, never a queue;
   no catch-up of missed ticks; `scheduler.enabled` is the kill switch read every tick.
+  Create/update validation is `scheduler/crud.ts`, shared by MCP, CLI and dashboard.
+  `install-service` (`packages/mcp/src/service.ts`) renders a per-user unit (launchd,
+  systemd --user, Task Scheduler XML) from machine paths: never version a unit, re-run it
+  after every build (it restarts the service). Not the OS crontab: see PLAN.md §7.
 
 - **Verify every `claude` CLI flag against `claude --help` before using it.** Flags change
   between versions; `PLAN.md` §1 lists the ones verified so far.

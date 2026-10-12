@@ -12,7 +12,7 @@ import { logger } from "@duskfleet/core";
 const log = logger("mcp");
 
 async function main(): Promise<void> {
-  const app = await bootstrap(import.meta.url);
+  const app = await bootstrap(import.meta.url, { role: "mcp" });
 
   let version: string | null = null;
   try {

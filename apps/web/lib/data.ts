@@ -1,7 +1,9 @@
 /**
  * Server-only data access for the dashboard. Reads the same config/ and
- * data/duskfleet.db the MCP server uses. Read-only: the dashboard never
- * mutates runs; cancelling goes through the MCP server (cancel_run) or the CLI.
+ * data/duskfleet.db the MCP server uses. The dashboard never mutates runs;
+ * cancelling goes through the MCP server (cancel_run) or the CLI. Its writes
+ * are server actions on user agent files (app/agents/actions.ts) and on
+ * schedule rows (app/schedules/actions.ts), both on the core API.
  */
 import "server-only";
 import { describeCron, findRepoRoot, listProjectAgents, loadConfig, nextFire, openDatabase, parseCron, resolveClaudeBinary, resolveConfigDir, RunRepository, ScheduleRepository, type DuskFleetConfig, type ProjectAgentInfo, type Run, type RunStatus } from "@duskfleet/core";

@@ -22,7 +22,15 @@
 - **Runs failed with "orphaned"**: DuskFleet was restarted while they were running. Resume the
   Claude session with the `resumeCommand` from `get_run` if you want to continue the work.
 - **Two DuskFleet processes, schedules fire once**: that is the SQLite lease at work. The
-  dashboard's Schedules page shows the holder.
+  dashboard's Schedules page and `doctor` show the holder and its kind (`serve`, `mcp`).
+- **Schedules stop when Claude Desktop closes**: only the MCP server was ticking. Install the
+  service once with `npm run cli -- install-service`; `doctor` reports `scheduler.service`.
+  If the service is running but nothing fires, read `data/logs/serve.log` (the service writes
+  there, not to the terminal); a `claude` not found there means the unit's PATH / `CLAUDE_BIN`
+  are stale, re-run `install-service`.
+- **The service runs old code**: `install-service` again after every `npm run build` (it
+  restarts the process), or `launchctl kickstart -k gui/$(id -u)/com.duskfleet.scheduler` /
+  `systemctl --user restart duskfleet.service`.
 - **New code is not picked up**: the MCP host keeps the server process alive. After
   `npm run build`, restart Claude Desktop or the Claude Code session. Config changes need no restart.
 - **`npm install` fails on root-owned files in `~/.npm`**: use `npm install --cache "$TMPDIR/npm-cache"`.

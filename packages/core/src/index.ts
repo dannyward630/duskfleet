@@ -40,6 +40,7 @@ export * from "./evals/types.js";
 export * from "./scheduler/types.js";
 export { parseCron, nextFire, describeCron, localParts, assertTimeZone, CronError, type CronSpec } from "./scheduler/cron.js";
 export { Scheduler, type SchedulerOptions, type SchedulerStatus } from "./scheduler/scheduler.js";
+export { createSchedule, updateSchedule, validateScheduleInput, nextRunAtFor, formatHolder, parseHolder, DEFAULT_TIME_ZONE, type SchedulerRole } from "./scheduler/crud.js";
 export { ScheduleRepository } from "./storage/schedules.js";
 
 export { logger, type LogLevel } from "./util/log.js";

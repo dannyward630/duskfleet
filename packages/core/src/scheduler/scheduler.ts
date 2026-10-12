@@ -14,15 +14,17 @@ import { hostname } from "node:os";
 import type { RunManager } from "../orchestration/run-manager.js";
 import type { ScheduleRepository } from "../storage/schedules.js";
 import { logger } from "../util/log.js";
-import { CronError, assertTimeZone, nextFire, parseCron } from "./cron.js";
+import { createSchedule, formatHolder, nextRunAtFor, updateSchedule, type SchedulerRole } from "./crud.js";
 import type { Schedule, ScheduleInput, ScheduleOutcome, SchedulePatch } from "./types.js";
 
 const log = logger("scheduler");
 
 export interface SchedulerOptions {
   tickMs?: number;
-  /** Identifies this process in the lease; defaults to host:pid. */
+  /** Identifies this process in the lease; defaults to `<role>@host:pid`. */
   holder?: string;
+  /** What kind of process this is (`serve`, `mcp`, `cli`); the dashboard shows it as the lease holder. */
+  role?: SchedulerRole;
   now?: () => Date;
 }
 
@@ -51,39 +53,20 @@ export class Scheduler {
     options: SchedulerOptions = {},
   ) {
     this.tickMs = options.tickMs ?? 30_000;
-    this.holder = options.holder ?? `${hostname()}:${process.pid}`;
+    this.holder = options.holder ?? formatHolder(options.role ?? "unknown", hostname(), process.pid);
     this.now = options.now ?? (() => new Date());
   }
 
-  // ---- CRUD (validation lives here so MCP, CLI and tests share it) ---------
+  // ---- CRUD (validation lives in crud.ts so MCP, CLI, dashboard and tests share it) ----
 
   create(input: ScheduleInput): Schedule {
-    this.validate(input);
-    if (this.repo.findByName(input.name)) throw new Error(`a schedule named "${input.name}" already exists`);
-    const timeZone = input.timeZone ?? "Europe/London";
-    const nextRunAt = input.enabled === false ? null : this.computeNext(input.cron, timeZone);
-    const created = this.repo.insert({ ...input, timeZone, nextRunAt });
+    const created = createSchedule(this.repo, this.runs.config, input, this.now());
     log.info("schedule created", { id: created.id, name: created.name, cron: created.cron, tz: created.timeZone, next: created.nextRunAt });
     return created;
   }
 
   update(id: string, patch: SchedulePatch): Schedule {
-    const existing = this.repo.get(id);
-    if (!existing) throw new Error(`schedule not found: ${id}`);
-    const merged: ScheduleInput = {
-      name: patch.name ?? existing.name,
-      agentId: patch.agentId ?? existing.agentId,
-      projectId: patch.projectId === undefined ? existing.projectId : patch.projectId,
-      prompt: patch.prompt ?? existing.prompt,
-      model: patch.model === undefined ? existing.model : patch.model,
-      cron: patch.cron ?? existing.cron,
-      timeZone: patch.timeZone ?? existing.timeZone,
-      enabled: patch.enabled ?? existing.enabled,
-    };
-    this.validate(merged);
-    if (merged.name !== existing.name && this.repo.findByName(merged.name)) throw new Error(`a schedule named "${merged.name}" already exists`);
-    const nextRunAt = merged.enabled ? this.computeNext(merged.cron, merged.timeZone!) : null;
-    const updated = this.repo.update(id, { ...merged, nextRunAt });
+    const updated = updateSchedule(this.repo, this.runs.config, id, patch, this.now());
     log.info("schedule updated", { id, name: updated.name, enabled: updated.enabled, next: updated.nextRunAt });
     return updated;
   }
@@ -192,31 +175,6 @@ export class Scheduler {
   }
 
   private computeNext(cron: string, timeZone: string): string | null {
-    const next = nextFire(parseCron(cron), this.now(), timeZone);
-    return next ? next.toISOString() : null;
-  }
-
-  private validate(input: ScheduleInput): void {
-    if (!input.name?.trim()) throw new Error("name is required");
-    if (!input.prompt?.trim()) throw new Error("prompt is required");
-    try {
-      parseCron(input.cron);
-      assertTimeZone(input.timeZone ?? "Europe/London");
-    } catch (err) {
-      if (err instanceof CronError) throw new Error(err.message);
-      throw err;
-    }
-    const config = this.runs.config;
-    const agent = config.agents.get(input.agentId);
-    if (!agent) throw new Error(`unknown agent "${input.agentId}". Known: ${[...config.agents.keys()].join(", ")}`);
-    if (input.projectId && !config.projects.has(input.projectId)) {
-      throw new Error(`unknown project "${input.projectId}". Known: ${[...config.projects.keys()].join(", ")}`);
-    }
-    if (!input.projectId && !agent.project) {
-      throw new Error(`agent "${input.agentId}" is not bound to a project; pass project_id`);
-    }
-    if (input.projectId && agent.project && agent.project !== input.projectId) {
-      throw new Error(`agent "${input.agentId}" belongs to project "${agent.project}", cannot schedule it on "${input.projectId}"`);
-    }
+    return nextRunAtFor(cron, timeZone, this.now());
   }
 }

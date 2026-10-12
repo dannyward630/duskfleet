@@ -26,7 +26,11 @@ in the nav); the other pages are static.
   past 4 entries), limits, prompt preview and aggregate stats. User agents can be deleted or
   unlinked from here, with an inline confirmation; builtins are read-only.
 - **Schedules**: state, cron (human and raw), next tick (theoretical one for paused schedules),
-  last outcome and firing history, with copyable `update_schedule` / `create_schedule` examples.
+  last outcome and firing history. Each row can be paused / resumed, have its cron and time
+  zone edited, or be deleted (inline confirmation); the changes go through the same validation
+  as `update_schedule`. The badge says which kind of process ticks (service, MCP host) and
+  warns when only an MCP host does, with the `install-service` command. Creating a schedule and
+  changing its agent, project, prompt or model stay on MCP (copyable `create_schedule` example).
 - **MCP**: the tool catalogue (`packages/mcp/dist/tools.json`, generated at build time from the
   real server) with a sticky index, plus the registration snippets for Claude Desktop and
   Claude Code with your absolute paths.
@@ -34,6 +38,7 @@ in the nav); the other pages are static.
 A completed run that hit a permission denial or an allow-listed MCP server that never mounted
 is **needs review** (amber), never plain green.
 
-The dashboard is read-only by design: the Claude Code child processes belong to the MCP server
-process, so cancelling goes through `cancel_run` (Cowork) or the CLI. Its only writes are the
-two actions on user agent files (delete, unlink); it never mutates runs or builtins.
+The dashboard never mutates runs or builtins: the Claude Code child processes belong to the
+MCP server process, so cancelling goes through `cancel_run` (Cowork) or the CLI. Its writes are
+the actions on user agent files (delete, unlink) and on schedule rows (pause / resume, edit
+when, delete), all through the core API the MCP tools use.
