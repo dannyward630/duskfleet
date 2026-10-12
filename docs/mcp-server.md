@@ -63,7 +63,7 @@ recurse into itself.
 | `delete_schedule` | Remove a schedule |
 | `run_schedule_now` | Fire a schedule immediately, same busy rules as a tick |
 | `run_agent` | Start a run. `prompt` + (`project_path` \| `project_id`), optional `agent_id`, `model`, `wait_seconds` (≤300). Returns the run immediately unless waiting. |
-| `get_run` | Full run record incl. `claudeSessionId`, `resumeCommand`, tokens, cost, status. `include_output: true` adds the final message and event timeline. |
+| `get_run` | Full run record incl. `claudeSessionId`, `resumeCommand`, tokens, cost, status, and `subagents` (one per Agent call: type, brief, report, tools, model, tokens; see [agents](agents.md#subagents-inside-runs)). `include_output: true` adds the final message, untruncated briefs and reports, and the event timeline. |
 | `list_runs` | Recent runs with filters (`status`, `agent_id`, `project_path`, `limit`); `needsReview` per run |
 | `cancel_run` | SIGTERM (then SIGKILL) the run's process; recorded as `cancelled` |
 

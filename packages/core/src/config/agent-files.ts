@@ -11,6 +11,7 @@
  * A user agent with the same id as a builtin one overrides it. Only the user
  * directory is ever written by code; the repo stays untouched.
  */
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import path from "node:path";
@@ -133,6 +134,22 @@ export function listProjectAgents(projectPath: string): ProjectAgentInfo[] {
     });
   }
   return out;
+}
+
+/**
+ * Short content hash of `<project>/.claude/agents/<name>.md`, so a recorded subagent
+ * invocation can be tied to the exact persona that ran. Null when the name is not a
+ * project agent (builtins such as `claude` or `Explore`, or a name chosen in frontmatter).
+ */
+export function projectAgentDefinitionHash(projectPath: string, name: string): string | null {
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) return null;
+  const file = path.join(projectPath, ".claude", "agents", `${name}.md`);
+  if (!existsSync(file)) return null;
+  try {
+    return createHash("sha256").update(readFileSync(file)).digest("hex").slice(0, 12);
+  } catch {
+    return null;
+  }
 }
 
 /**

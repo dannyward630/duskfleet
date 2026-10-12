@@ -159,7 +159,8 @@ async function main(): Promise<void> {
         process.stderr.write(`run not found: ${id}\n`);
         return done(1);
       }
-      print(values.events ? { ...run, events: app.runs.events(id) } : run);
+      const subagents = app.runs.agents(id);
+      print(values.events ? { ...run, subagents, events: app.runs.events(id) } : { ...run, subagents });
       return done();
     }
     default:

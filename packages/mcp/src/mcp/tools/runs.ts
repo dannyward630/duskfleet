@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { RUN_STATUSES, summarizeRun, type Run } from "@duskfleet/core";
+import { RUN_STATUSES, summarizeRun, type Run, type RunAgent } from "@duskfleet/core";
 import { errorResult, jsonResult, type ToolContext } from "../server.js";
 
 const MAX_WAIT_SECONDS = 300;
@@ -19,6 +19,12 @@ function presentRun(run: Run, includeOutput: boolean) {
     resultTruncated: includeOutput && resultText !== null && resultText.length > OUTPUT_LIMIT,
     ...(includeOutput && resultText && resultText.length > OUTPUT_LIMIT ? { resultText: resultText.slice(0, OUTPUT_LIMIT) } : {}),
   };
+}
+
+/** Subagent rows are small except for prompt and report; those are shortened unless output was asked for. */
+function presentSubagent(s: RunAgent, includeOutput: boolean) {
+  const clip = (t: string | null) => (includeOutput || !t || t.length <= 300 ? t : t.slice(0, 297) + "...");
+  return { ...s, prompt: clip(s.prompt), resultText: clip(s.resultText) };
 }
 
 export function registerRunTools(server: McpServer, ctx: ToolContext): void {
@@ -63,8 +69,9 @@ export function registerRunTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Get run",
       description:
-        "Fetch a run by id: status, timings, Claude session id, model, tokens, cost, tool calls, errors and " +
-        "the command to resume the session. Set include_output to get the agent's final message and event timeline.",
+        "Fetch a run by id: status, timings, Claude session id, model, tokens, cost, tool calls, errors, " +
+        "the command to resume the session and the subagents it delegated to (one entry per Agent call: type, brief, " +
+        "report, tools, model, tokens). Set include_output to get the full final message, full subagent briefs and reports, and the event timeline.",
       inputSchema: {
         run_id: z.string().describe("Run id returned by run_agent or list_runs"),
         include_output: z.boolean().optional().describe("Include the full final message and the event timeline"),
@@ -74,7 +81,8 @@ export function registerRunTools(server: McpServer, ctx: ToolContext): void {
       const run = ctx.runs.getRun(run_id);
       if (!run) return errorResult(`run not found: ${run_id}`);
       const view = presentRun(run, Boolean(include_output));
-      return jsonResult(include_output ? { ...view, events: ctx.runs.events(run_id) } : view);
+      const subagents = ctx.runs.agents(run_id).map((s) => presentSubagent(s, Boolean(include_output)));
+      return jsonResult(include_output ? { ...view, subagents, events: ctx.runs.events(run_id) } : { ...view, subagents });
     },
   );
 
