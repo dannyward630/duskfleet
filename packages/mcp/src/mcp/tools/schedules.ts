@@ -41,6 +41,7 @@ export function registerScheduleTools(server: McpServer, ctx: ToolContext): void
     {
       title: "Create schedule",
       description:
+        "ONLY when the user explicitly asked for a DuskFleet schedule: it starts unattended, paid runs that recur until deleted. " +
         "Create a cron schedule that runs an agent unattended. Stored in the DuskFleet database and picked up on the next tick " +
         "(≤ tick_seconds). Fails on an unknown agent/project, an invalid cron or time zone, or a duplicate name.",
       inputSchema: { name: z.string().min(1).describe("Unique, human name, e.g. 'app main hourly'"), ...scheduleFields },
@@ -64,7 +65,9 @@ export function registerScheduleTools(server: McpServer, ctx: ToolContext): void
     "update_schedule",
     {
       title: "Update schedule",
-      description: "Change fields of a schedule; omitted fields keep their value. enabled: false pauses it (next_run_at cleared), true resumes from now.",
+      description:
+        "ONLY on an explicit user request for DuskFleet (the user names DuskFleet, an agent or a schedule). " +
+        "Change fields of a schedule; omitted fields keep their value. enabled: false pauses it (next_run_at cleared), true resumes from now.",
       inputSchema: {
         id: z.string().min(1).describe("Schedule id from list_schedules"),
         name: z.string().min(1).optional().describe("New human name"),
@@ -101,7 +104,9 @@ export function registerScheduleTools(server: McpServer, ctx: ToolContext): void
     "delete_schedule",
     {
       title: "Delete schedule",
-      description: "Delete a schedule. Past runs keep their schedule_id.",
+      description:
+        "ONLY on an explicit user request for DuskFleet (the user names DuskFleet, an agent or a schedule). " +
+        "Delete a schedule. Past runs keep their schedule_id.",
       inputSchema: { id: z.string().min(1).describe("Schedule id from list_schedules. Past runs and firings keep the id") },
     },
     async (args) => {
@@ -114,7 +119,9 @@ export function registerScheduleTools(server: McpServer, ctx: ToolContext): void
     "run_schedule_now",
     {
       title: "Run schedule now",
-      description: "Fire a schedule immediately, outside its cron (also when disabled). Same busy rules as a tick. Returns the run id or why it was skipped.",
+      description:
+        "ONLY when the user explicitly asked to fire it: it starts a paid run. " +
+        "Fire a schedule immediately, outside its cron (also when disabled). Same busy rules as a tick. Returns the run id or why it was skipped.",
       inputSchema: { id: z.string().min(1).describe("Schedule id from list_schedules. Fires now even if paused; WIP guards still apply") },
     },
     async (args) => {

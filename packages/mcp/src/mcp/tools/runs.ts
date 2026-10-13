@@ -33,6 +33,8 @@ export function registerRunTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Run agent",
       description:
+        "ONLY when the user explicitly asked for a DuskFleet run: it spawns a separate Claude Code session that costs real money. " +
+        "Never use it to delegate or parallelise your own task. " +
         "Launch a Claude Code agent against a local project. The project directory becomes the working directory, " +
         "so the project's CLAUDE.md, .claude/ settings, skills and agents apply. Returns the run immediately " +
         "(status running) unless wait_seconds is given, in which case it waits up to that long for completion. " +

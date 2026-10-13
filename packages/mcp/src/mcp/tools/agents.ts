@@ -166,6 +166,7 @@ export function registerAgentTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Create agent",
       description:
+        "ONLY on an explicit user request for DuskFleet (the user names DuskFleet, an agent or a schedule). " +
         "Create an agent. FIRST decide its kind: " +
         "'own' = a NEW agent whose persona you write here (system_prompt required, no claude_agent); " +
         "'link' = a LINK to an agent the target project already defines in .claude/agents/<name>.md " +
@@ -223,6 +224,7 @@ export function registerAgentTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Update agent",
       description:
+        "ONLY on an explicit user request for DuskFleet (the user names DuskFleet, an agent or a schedule). " +
         "Change fields of a user agent; omitted fields keep their value. The agent keeps its kind unless you pass one: " +
         "kind 'link' (with claude_agent, project) turns an own agent into a link; kind 'own' (with a system_prompt) or clear: [\"claude_agent\"] " +
         "turns a link back into an own agent. Builtin agents are versioned in config/agents and are not edited by tools: " +
@@ -268,7 +270,9 @@ export function registerAgentTools(server: McpServer, ctx: ToolContext): void {
     "delete_agent",
     {
       title: "Delete agent",
-      description: "Delete a user agent file. Builtin agents cannot be deleted. Past runs keep their recorded agent id.",
+      description:
+        "ONLY on an explicit user request for DuskFleet (the user names DuskFleet, an agent or a schedule). " +
+        "Delete a user agent file. Builtin agents cannot be deleted. Past runs keep their recorded agent id.",
       inputSchema: { id: z.string().regex(AGENT_ID_PATTERN).describe("Agent id from list_agents. Only user agents (data/agents) can be deleted") },
     },
     async (args) => {

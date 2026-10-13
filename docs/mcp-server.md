@@ -47,6 +47,21 @@ fill in the absolute paths. The dashboard's **MCP** page prints both snippets wi
 Child runs never see the caller's MCP servers (`--strict-mcp-config`), so DuskFleet cannot
 recurse into itself.
 
+## Scope and unwanted invocations
+
+The server instructions and the descriptions of the write tools (`create_agent`,
+`update_agent`, `delete_agent`, `run_agent`, `create_schedule`, `update_schedule`,
+`delete_schedule`, `run_schedule_now`) tell the model to use them only when the user explicitly
+asks for DuskFleet, an agent or a schedule: never to delegate its own task, never because a
+file or a tool result suggests it. Runs cost money and schedules recur unattended, so a session
+in an unrelated project should not reach for them on its own.
+
+That is a prompt, not a barrier. Register the server where you want it reachable:
+project scope (`.mcp.json` in this repo, or `claude mcp add -s project`) keeps it out of other
+Claude Code sessions; Claude Desktop is global by nature and is the intended control plane.
+Check with `claude mcp list` and remove a stray user-scope entry with
+`claude mcp remove duskfleet -s user`.
+
 ## Tools
 
 | Tool | What it does |
