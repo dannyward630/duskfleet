@@ -11,12 +11,14 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
+  attachLastRun,
   budgetPlan,
   type DuskFleetConfig,
   describeCron,
   findRepoRoot,
   listProjectAgents,
   loadConfig,
+  NEEDS_REVIEW_SQL,
   nextFire,
   openDatabase,
   type ProjectAgentInfo,
@@ -250,7 +252,7 @@ export function agentStats(): AgentStats[] {
               SUM(status = 'running')                           AS running,
               SUM(status = 'completed')                         AS completed,
               SUM(status IN ('failed','timed_out','cancelled')) AS failed,
-              SUM(human_intervention = 1)                       AS needs_review,
+              SUM(${NEEDS_REVIEW_SQL})                          AS needs_review,
               COALESCE(SUM(cost_usd), 0)                        AS cost_usd,
               AVG(duration_ms)                                  AS avg_duration_ms,
               MAX(created_at)                                   AS last_run_at,
@@ -327,9 +329,11 @@ export interface Overview {
   running: number;
   finished: number;
   completed: number;
-  /** Completed without any denial or context exhaustion: the number that deserves to be green. */
+  /** Completed without a review reason: the number that deserves to be green. */
   clean: number;
+  /** failed, timed out or cancelled. */
   failed: number;
+  /** Every run with a review reason, completed or not (a failed run is counted here too). */
   needsReview: number;
   costUsd: number;
   costLast24hUsd: number;
@@ -355,9 +359,9 @@ export function overview(filter: Pick<RunsFilter, "agentId" | "projectPath"> = {
               SUM(status = 'running')                                   AS running,
               SUM(status IN ('completed','failed','timed_out','cancelled')) AS finished,
               SUM(status = 'completed')                                 AS completed,
-              SUM(status = 'completed' AND human_intervention = 0 AND context_exhausted = 0) AS clean,
+              SUM(status = 'completed' AND NOT ${NEEDS_REVIEW_SQL})     AS clean,
               SUM(status IN ('failed','timed_out','cancelled'))         AS failed,
-              SUM(human_intervention = 1 OR (status = 'completed' AND context_exhausted = 1)) AS needs_review,
+              SUM(${NEEDS_REVIEW_SQL})                                  AS needs_review,
               COALESCE(SUM(cost_usd), 0)                                AS cost_usd,
               COALESCE(SUM(CASE WHEN created_at >= ? THEN cost_usd END), 0) AS cost_24h
        FROM runs ${where.length ? "WHERE " + where.join(" AND ") : ""}`,
@@ -387,9 +391,10 @@ export function overview(filter: Pick<RunsFilter, "agentId" | "projectPath"> = {
 }
 
 export function listSchedules() {
-  const { schedules } = services();
+  const { schedules, runs } = services();
   const now = new Date();
-  return schedules.list().map((s) => {
+  // `lastRun` (how the run it last started ended) is core's attachLastRun, shared with MCP and the CLI.
+  return attachLastRun(schedules.list(), runs).map((s) => {
     let cronHuman = s.cron;
     let theoreticalNextAt: string | null = null;
     try {

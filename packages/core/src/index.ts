@@ -42,7 +42,6 @@ export { ClaudeCodeExecutor, type ClaudeCodeExecutorOptions, resolveClaudeBinary
 export {
   createStreamState,
   ingestLine,
-  isBudgetExhausted,
   looksLikeContextExhaustion,
   type ParsedResult,
   type StreamState,
@@ -83,10 +82,11 @@ export {
   updateSchedule,
   validateScheduleInput,
 } from "./scheduler/crud.js";
+export { attachLastRun, type RunSummarySource, type ScheduleWithLastRun } from "./scheduler/last-run.js";
 export { Scheduler, type SchedulerOptions, type SchedulerStatus } from "./scheduler/scheduler.js";
 export * from "./scheduler/types.js";
 export { migrationDigests, openDatabase } from "./storage/db.js";
-export { type ListRunsFilter, type RunPatch, RunRepository } from "./storage/runs.js";
+export { type ListRunsFilter, NEEDS_REVIEW_SQL, type RunPatch, RunRepository } from "./storage/runs.js";
 export { ScheduleRepository } from "./storage/schedules.js";
 
 export { type LogLevel, logger } from "./util/log.js";
