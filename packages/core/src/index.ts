@@ -50,7 +50,12 @@ export * from "./execution/types.js";
 export * from "./observability/run.js";
 export { ProjectValidationError, validateProjectPath } from "./orchestration/project-validation.js";
 
-export { mcpToolPrefix, RunManager, type StartRunInput } from "./orchestration/run-manager.js";
+export {
+  mcpToolPrefix,
+  RunManager,
+  type RunManagerOptions,
+  type StartRunInput,
+} from "./orchestration/run-manager.js";
 export { assertTransition, IllegalTransitionError } from "./orchestration/run-state.js";
 export { summarizeToolInput } from "./orchestration/tool-summary.js";
 export {
@@ -68,6 +73,7 @@ export {
   formatHolder,
   nextRunAtFor,
   parseHolder,
+  processIdentity,
   type SchedulerRole,
   updateSchedule,
   validateScheduleInput,

@@ -39,6 +39,7 @@ interface RunRow {
   log_path: string | null;
   raw_result_json: string | null;
   schedule_id: string | null;
+  owner: string | null;
 }
 
 function rowToRun(r: RunRow): Run {
@@ -78,6 +79,7 @@ function rowToRun(r: RunRow): Run {
     logPath: r.log_path,
     rawResultJson: r.raw_result_json,
     scheduleId: r.schedule_id ?? null,
+    owner: r.owner ?? null,
   };
 }
 
@@ -160,8 +162,8 @@ export class RunRepository {
            created_at, started_at, ended_at, duration_ms, claude_session_id, permission_mode, command_json,
            exit_code, termination_reason, error, result_text, num_turns, tool_calls, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, permission_denials, denied_tools_json, mcp_json, human_intervention,
-           context_exhausted, retries, log_path, raw_result_json, schedule_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           context_exhausted, retries, log_path, raw_result_json, schedule_id, owner)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         run.id,
@@ -199,10 +201,23 @@ export class RunRepository {
         run.logPath,
         run.rawResultJson,
         run.scheduleId,
+        run.owner,
       );
   }
 
   update(id: string, patch: RunPatch): void {
+    this.updateWhere(id, patch, null);
+  }
+
+  /**
+   * Apply the patch only while the row still has status `expected` (compare-and-set
+   * between processes sharing the database). Returns false when another writer got there first.
+   */
+  updateIfStatus(id: string, expected: RunStatus, patch: RunPatch): boolean {
+    return this.updateWhere(id, patch, expected);
+  }
+
+  private updateWhere(id: string, patch: RunPatch, expected: RunStatus | null): boolean {
     const sets: string[] = [];
     const values: Array<string | number | null> = [];
     for (const [key, value] of Object.entries(patch) as Array<[keyof RunPatch, unknown]>) {
@@ -212,9 +227,15 @@ export class RunRepository {
       else if (typeof value === "object" && value !== null) values.push(JSON.stringify(value));
       else values.push(value as string | number | null);
     }
-    if (sets.length === 0) return;
+    if (sets.length === 0) return false;
     values.push(id);
-    this.db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...values);
+    let where = "id = ?";
+    if (expected !== null) {
+      where += " AND status = ?";
+      values.push(expected);
+    }
+    const r = this.db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE ${where}`).run(...values);
+    return Number(r.changes) > 0;
   }
 
   get(id: string): Run | null {
