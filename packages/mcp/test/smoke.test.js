@@ -193,7 +193,11 @@ test("subagent invocations are recorded as run_agents rows with the persona hash
     assert.equal(s.subagentType, "reviewer");
     assert.equal(s.description, "Review the diff");
     assert.equal(s.prompt, "Review the diff and report problems. Do not edit files.");
-    assert.equal(s.resultText, "[Subagent hand-back] Two findings: x is unused; y lacks a test.");
+    assert.equal(
+      s.resultText,
+      "Two findings:\n- x is unused\n- y lacks a test.",
+      "hand-back frame, indent and footer stripped",
+    );
     assert.equal(s.status, "completed");
     assert.equal(s.model, "claude-haiku-5-5");
     assert.equal(s.parentAgentId, null);
@@ -223,6 +227,80 @@ test("subagent invocations are recorded as run_agents rows with the persona hash
       ],
     );
     assert.equal(events[7].payload.status, "completed");
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("subagent rows recorded by an older parser are repaired from the jsonl log by the backfill, never on read", async () => {
+  const app = makeApp();
+  try {
+    const started = await app.runs.startRun({ prompt: "subagent", projectPath: app.project });
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    // What the 2026-10-14 run looked like to its reader: no type, no brief, raw report, no duration,
+    // and left open (the process died before closing it) although the log has its hand-back.
+    app.db
+      .prepare(
+        "UPDATE run_agents SET subagent_type = 'unknown', description = NULL, prompt = NULL, result_text = ?, duration_ms = NULL, total_tokens = NULL, tool_calls = 0, status = 'running', ended_at = NULL WHERE run_id = ?",
+      )
+      .run(
+        "[Subagent hand-back] frame. The report follows:\n  raw report\nagentId: x\n<usage>tool_uses: 2</usage>",
+        run.id,
+      );
+    // A row the log knows nothing about, never closed: interrupted by the backfill.
+    const [orig] = app.runs.agents(run.id);
+    const { runId: _r, definitionHash: _h, ...ghost } = orig;
+    new RunRepository(app.db).upsertAgent(
+      run.id,
+      { ...ghost, agentId: "ghost", parentToolUseId: null, resultText: null, status: "running", endedAt: null },
+      null,
+    );
+
+    assert.equal(app.runs.agents(run.id)[0].subagentType, "unknown", "a read does not write");
+    assert.deepEqual(await app.runs.repairSubagents(), { runsChecked: 1, rowsRepaired: 2 });
+    assert.deepEqual(
+      await app.runs.repairSubagents(),
+      { runsChecked: 1, rowsRepaired: 0 },
+      "re-running settles: nothing left to write",
+    );
+    const [s, g] = app.runs.agents(run.id);
+    assert.equal(s.status, "completed", "closed from the log's hand-back");
+    assert.ok(s.endedAt);
+    assert.equal(g.status, "interrupted");
+    assert.equal(g.endedAt, run.endedAt);
+    assert.equal(s.subagentType, "reviewer");
+    assert.equal(s.description, "Review the diff");
+    assert.equal(s.prompt, "Review the diff and report problems. Do not edit files.");
+    assert.equal(
+      s.resultText,
+      "Two findings:\n- x is unused\n- y lacks a test.",
+      "the log's report replaces the raw one",
+    );
+    assert.equal(s.durationMs, 4500);
+    assert.equal(s.totalTokens, 865);
+    assert.equal(s.toolCalls, 2);
+    // Written back: a plain read of the table now has it too.
+    const row = app.db
+      .prepare("SELECT subagent_type, prompt, duration_ms FROM run_agents WHERE run_id = ?")
+      .get(run.id);
+    assert.equal(row.subagent_type, "reviewer");
+    assert.equal(row.duration_ms, 4500);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("the backfill leaves open rows alone when the run's log is gone", async () => {
+  const app = makeApp();
+  try {
+    const started = await app.runs.startRun({ prompt: "subagent", projectPath: app.project });
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    app.db.prepare("UPDATE run_agents SET status = 'running', ended_at = NULL WHERE run_id = ?").run(run.id);
+    rmSync(run.logPath, { force: true });
+    assert.deepEqual(await app.runs.repairSubagents(), { runsChecked: 1, rowsRepaired: 0 });
+    const [s] = app.runs.agents(run.id);
+    assert.equal(s.status, "running", "no log read: nothing says the run left it open");
+    assert.equal(s.endedAt, null);
   } finally {
     await app.cleanup();
   }

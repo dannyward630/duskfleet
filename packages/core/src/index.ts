@@ -39,14 +39,16 @@ export {
 export * from "./config/types.js";
 export * from "./evals/types.js";
 export { ClaudeCodeExecutor, type ClaudeCodeExecutorOptions, resolveClaudeBinary } from "./execution/claude-code.js";
+export { mergeSubagent, needsRepair, sameSubagent, subagentsFromLog } from "./execution/log-replay.js";
 export {
+  cleanHandBack,
   createStreamState,
   ingestLine,
+  isRawHandBack,
   looksLikeContextExhaustion,
   type ParsedResult,
   type StreamState,
 } from "./execution/stream-json.js";
-
 export * from "./execution/types.js";
 export * from "./observability/run.js";
 export { ProjectValidationError, validateProjectPath } from "./orchestration/project-validation.js";
