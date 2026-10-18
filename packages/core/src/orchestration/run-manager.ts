@@ -9,6 +9,7 @@ import path from "node:path";
 import { listProjectAgents, projectAgentDefinitionHash } from "../config/agent-files.js";
 import { loadConfig } from "../config/loader.js";
 import type { AgentDefinition, DuskFleetConfig, ProjectDefinition } from "../config/types.js";
+import { isBudgetExhausted } from "../execution/stream-json.js";
 import type {
   ExecutionEvent,
   ExecutionHandle,
@@ -17,8 +18,9 @@ import type {
   Executor,
   McpServerInfo,
   SubagentRecord,
+  TokenUsage,
 } from "../execution/types.js";
-import { isTerminal, type Run, type RunAgent, type RunStatus } from "../observability/run.js";
+import { isTerminal, type Run, type RunAgent, type RunPhase, type RunStatus } from "../observability/run.js";
 import { parseHolder, processIdentity } from "../scheduler/crud.js";
 import type { ListRunsFilter, RunRepository } from "../storage/runs.js";
 import { logger } from "../util/log.js";
@@ -51,6 +53,50 @@ interface ActiveRun {
   allowedTools: string[];
   mounted: McpServerInfo[];
   usedServers: Set<string>;
+  /** The request of the main pass; the wrap-up pass is derived from it. */
+  request: ExecutionRequest;
+  /** Which process is running right now. */
+  phase: RunPhase["phase"];
+  /** Finished processes of this run, in order. */
+  phases: RunPhase[];
+  /** Dollars kept back for the wrap-up pass (0 = none). */
+  reserveUsd: number;
+  /** Result of the main pass while the wrap-up pass runs. */
+  mainResult: ExecutionResult | null;
+  /** cancel_run or shutdown() was called: never start a wrap-up pass after that, even if the main pass ended on its budget first. */
+  cancelRequested: boolean;
+  /** When the main pass was launched; the wrap-up pass only gets what is left of the run's timeout. */
+  startedAtMs: number;
+}
+
+/** What the wrap-up pass is told. It must not start new work; it must leave a trace of where the run stopped. */
+export const WRAP_UP_PROMPT =
+  "Your budget is exhausted. Do not start new work or call subagents. Record exactly where you stopped and why, " +
+  "in the place your instructions say (ticket comment, PR comment, or final message), then stop.";
+
+/**
+ * The wrap-up pass is short by design: at most this, and never more than what is left of
+ * the run's own timeout (the run as a whole never outlasts `timeout_minutes`).
+ */
+const WRAP_UP_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * How a run's budget is split: the main pass gets `main`, the wrap-up pass (only after
+ * a budget exhaustion) gets `reserve`. Default reserve: 10% of the budget, at least $0.50,
+ * never more than half of it. An explicit `wrap_up_reserve_usd` is capped the same way; 0 disables.
+ */
+export function budgetPlan(
+  agent: Pick<AgentDefinition, "maxBudgetUsd" | "wrapUpReserveUsd">,
+  config: Pick<DuskFleetConfig, "claude">,
+): { total: number; main: number; reserve: number } {
+  const total = agent.maxBudgetUsd ?? config.claude.defaultMaxBudgetUsd;
+  const wanted = agent.wrapUpReserveUsd ?? Math.max(0.5, total * 0.1);
+  const reserve = wanted <= 0 ? 0 : round(Math.min(wanted, total / 2));
+  return { total, main: round(total - reserve), reserve };
+}
+
+function round(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 /** Event payload for a subagent start/end: enough to read the timeline without the row. */
@@ -232,7 +278,7 @@ export class RunManager {
     const sessionId = randomUUID();
     const model = input.model ?? agent.model;
     const timeoutMinutes = agent.timeoutMinutes ?? this.config.claude.defaultTimeoutMinutes;
-    const maxBudgetUsd = agent.maxBudgetUsd ?? this.config.claude.defaultMaxBudgetUsd;
+    const budget = budgetPlan(agent, this.config);
     const logPath = path.join(this.config.dataDir, "logs", `${runId}.jsonl`);
 
     const request: ExecutionRequest = {
@@ -241,7 +287,7 @@ export class RunManager {
       sessionId,
       permissionMode: agent.permissionMode,
       timeoutMs: timeoutMinutes * 60_000,
-      maxBudgetUsd,
+      maxBudgetUsd: budget.main,
       logPath,
     };
     if (model) request.model = model;
@@ -301,6 +347,7 @@ export class RunManager {
       rawResultJson: null,
       scheduleId: input.scheduleId ?? null,
       owner: this.owner,
+      phases: [],
     };
 
     // Insert first so that events emitted by the executor always find the row.
@@ -324,11 +371,26 @@ export class RunManager {
       allowedTools: agent.allowedTools ?? [],
       mounted: [],
       usedServers: new Set(),
+      request,
+      phase: "main",
+      phases: [],
+      reserveUsd: budget.reserve,
+      mainResult: null,
+      cancelRequested: false,
+      startedAtMs: Date.now(),
     });
     this.transition(run, "running", { startedAt: new Date().toISOString(), command: handle.command });
-    log.info("run started", { runId, agent: agent.id, cwd: projectPath, pid: handle.pid, model: model ?? "(default)" });
+    log.info("run started", {
+      runId,
+      agent: agent.id,
+      cwd: projectPath,
+      pid: handle.pid,
+      model: model ?? "(default)",
+      budgetUsd: budget.main,
+      reserveUsd: budget.reserve,
+    });
 
-    void handle.done.then((result) => this.onFinished(runId, result));
+    void handle.done.then((result) => this.onPhaseFinished(runId, result));
 
     return this.runs.get(runId)!;
   }
@@ -339,6 +401,7 @@ export class RunManager {
     if (isTerminal(run.status)) return run;
     const active = this.active.get(id);
     if (active) {
+      active.cancelRequested = true;
       active.handle.cancel(); // completion path will record `cancelled`
       this.runs.addEvent(id, "note", { message: "cancel requested" });
       return run;
@@ -358,11 +421,22 @@ export class RunManager {
   /** Resolve when the run reaches a terminal state or the timeout elapses. */
   async waitForRun(id: string, timeoutMs: number): Promise<Run> {
     const deadline = Date.now() + timeoutMs;
-    const handle = this.active.get(id)?.handle;
-    if (handle && timeoutMs > 0) {
-      await Promise.race([handle.done, new Promise((r) => setTimeout(r, Math.max(0, deadline - Date.now())))]);
-      // Give the completion handler a tick to write the final state.
+    // A run can span more than one process (wrap-up pass): keep waiting while a new handle replaces the finished one.
+    for (;;) {
+      const handle = this.active.get(id)?.handle;
+      const remaining = deadline - Date.now();
+      if (!handle || remaining <= 0) break;
+      let timer: NodeJS.Timeout | undefined;
+      const finished = await Promise.race([
+        handle.done.then(() => true),
+        new Promise<boolean>((r) => {
+          timer = setTimeout(() => r(false), remaining);
+        }),
+      ]);
+      clearTimeout(timer);
+      // Give the completion handler a tick to write the final state (or start the next phase).
       await new Promise((r) => setImmediate(r));
+      if (!finished || this.active.get(id)?.handle === handle) break;
     }
     return this.runs.get(id)!;
   }
@@ -371,13 +445,106 @@ export class RunManager {
   shutdown(): void {
     for (const [id, a] of this.active) {
       log.warn("shutdown: cancelling active run", { runId: id });
+      a.cancelRequested = true;
       a.handle.cancel();
     }
   }
 
   // ---- internals -----------------------------------------------------------
 
-  private onFinished(runId: string, result: ExecutionResult): void {
+  /**
+   * A process of the run ended. The main pass that ran out of budget is followed by one
+   * wrap-up pass on the same session (reserve budget, WRAP_UP_PROMPT); everything else
+   * closes the run. The run's status is always the main pass's outcome, except that a
+   * wrap-up pass cancelled by the user records the run as cancelled.
+   */
+  private onPhaseFinished(runId: string, result: ExecutionResult): void {
+    const active = this.active.get(runId);
+    if (!active) {
+      this.onFinished(runId, result, [phaseOf("main", result, null)]);
+      return;
+    }
+    const budgetUsd = active.phase === "main" ? (active.request.maxBudgetUsd ?? null) : active.reserveUsd;
+    active.phases.push(phaseOf(active.phase, result, budgetUsd));
+    const runOpen = !isTerminal(this.runs.get(runId)?.status ?? "failed");
+    if (
+      active.phase === "main" &&
+      result.outcome === "failed" &&
+      isBudgetExhausted(result.terminationReason) &&
+      active.reserveUsd > 0 &&
+      runOpen
+    ) {
+      // A cancel that raced the budget stop (the child had already exited) must still win.
+      if (active.cancelRequested)
+        this.runs.addEvent(runId, "note", { message: "wrap-up pass skipped: cancel requested" });
+      else if (this.startWrapUp(runId, active, result)) return;
+    }
+    if (active.phase === "wrap_up" && active.mainResult) {
+      this.runs.addEvent(runId, "phase", {
+        phase: "wrap_up",
+        status: "ended",
+        outcome: result.outcome,
+        costUsd: result.costUsd,
+        durationMs: result.durationMs,
+        numTurns: result.numTurns,
+      });
+      this.onFinished(runId, mergeResults(active.mainResult, result), active.phases);
+      return;
+    }
+    this.onFinished(runId, result, active.phases);
+  }
+
+  /** Resume the session with the reserve budget. Returns false when nothing could be started (the run then closes on the main result). */
+  private startWrapUp(runId: string, active: ActiveRun, main: ExecutionResult): boolean {
+    const runTimeoutMs = active.request.timeoutMs;
+    const leftMs =
+      runTimeoutMs && runTimeoutMs > 0 ? runTimeoutMs - (Date.now() - active.startedAtMs) : WRAP_UP_TIMEOUT_MS;
+    if (leftMs <= 0) {
+      this.runs.addEvent(runId, "note", { message: "wrap-up pass skipped: the run's timeout is used up" });
+      return false;
+    }
+    const request: ExecutionRequest = {
+      ...active.request,
+      prompt: WRAP_UP_PROMPT,
+      resumeSessionId: main.sessionId || active.request.sessionId,
+      maxBudgetUsd: active.reserveUsd,
+      timeoutMs: Math.min(leftMs, WRAP_UP_TIMEOUT_MS),
+    };
+    const couldNotStart = (reason: string) => {
+      this.runs.addEvent(runId, "note", { message: `wrap-up pass could not start: ${reason}` });
+      return false;
+    };
+    let handle: ExecutionHandle;
+    try {
+      handle = this.executor.execute(request, (event) => this.onEvent(runId, event));
+    } catch (err) {
+      // Executors may throw before spawning (startRun handles the same case).
+      return couldNotStart(err instanceof Error ? err.message : String(err));
+    }
+    // ClaudeCodeExecutor does not throw on a spawn failure: it returns a handle without a pid
+    // whose `done` resolves failed. That is not a wrap-up pass that ran; close on the main result.
+    if (handle.pid === null) return couldNotStart("the process did not spawn (no pid)");
+    this.runs.addEvent(runId, "phase", {
+      phase: "wrap_up",
+      status: "started",
+      budgetUsd: active.reserveUsd,
+      mainCostUsd: main.costUsd,
+      reason: main.terminationReason,
+    });
+    active.handle = handle;
+    active.phase = "wrap_up";
+    active.mainResult = main;
+    log.info("wrap-up pass started", {
+      runId,
+      pid: handle.pid,
+      budgetUsd: active.reserveUsd,
+      mainCostUsd: main.costUsd,
+    });
+    void handle.done.then((result) => this.onPhaseFinished(runId, result));
+    return true;
+  }
+
+  private onFinished(runId: string, result: ExecutionResult, phases: RunPhase[]): void {
     const active = this.active.get(runId);
     this.active.delete(runId);
     try {
@@ -428,12 +595,14 @@ export class RunManager {
         humanIntervention: result.permissionDenials > 0,
         contextExhausted: result.contextExhausted,
         rawResultJson: result.rawResult === null ? null : JSON.stringify(result.rawResult),
+        phases,
       });
       log.info("run finished", {
         runId,
         status: result.outcome,
         durationMs: result.durationMs,
         costUsd: result.costUsd,
+        phases: phases.length,
       });
     } catch (err) {
       log.error("failed to record run completion", { runId, err: err instanceof Error ? err.message : String(err) });
@@ -568,4 +737,54 @@ export class RunManager {
         break; // assistant_text and stderr go to the log file only
     }
   }
+}
+
+function phaseOf(phase: RunPhase["phase"], r: ExecutionResult, budgetUsd: number | null): RunPhase {
+  return {
+    phase,
+    startedAt: r.startedAt,
+    endedAt: r.endedAt,
+    durationMs: r.durationMs,
+    outcome: r.outcome,
+    terminationReason: r.terminationReason,
+    budgetUsd,
+    costUsd: r.costUsd,
+    numTurns: r.numTurns,
+    toolCalls: r.toolCalls,
+  };
+}
+
+function addNullable(a: number | null, b: number | null): number | null {
+  if (a === null && b === null) return null;
+  return (a ?? 0) + (b ?? 0);
+}
+
+/**
+ * The run as one record: the main pass decides status, error and termination reason;
+ * cost, turns, tool calls, tokens and denials are summed; the final text is the wrap-up's
+ * (that is where the agent said where it stopped), falling back to the main pass's.
+ */
+export function mergeResults(main: ExecutionResult, wrapUp: ExecutionResult): ExecutionResult {
+  const usage: TokenUsage = {
+    inputTokens: addNullable(main.usage.inputTokens, wrapUp.usage.inputTokens),
+    outputTokens: addNullable(main.usage.outputTokens, wrapUp.usage.outputTokens),
+    cacheReadTokens: addNullable(main.usage.cacheReadTokens, wrapUp.usage.cacheReadTokens),
+    cacheCreationTokens: addNullable(main.usage.cacheCreationTokens, wrapUp.usage.cacheCreationTokens),
+  };
+  return {
+    ...main,
+    outcome: wrapUp.outcome === "cancelled" ? "cancelled" : main.outcome,
+    model: main.model ?? wrapUp.model,
+    endedAt: wrapUp.endedAt,
+    durationMs: Math.max(0, Date.parse(wrapUp.endedAt) - Date.parse(main.startedAt)),
+    resultText: wrapUp.resultText ?? main.resultText,
+    numTurns: addNullable(main.numTurns, wrapUp.numTurns),
+    toolCalls: main.toolCalls + wrapUp.toolCalls,
+    usage,
+    costUsd: addNullable(main.costUsd, wrapUp.costUsd),
+    permissionDenials: main.permissionDenials + wrapUp.permissionDenials,
+    deniedTools: [...main.deniedTools, ...wrapUp.deniedTools],
+    contextExhausted: main.contextExhausted || wrapUp.contextExhausted,
+    subagents: [...main.subagents, ...wrapUp.subagents],
+  };
 }

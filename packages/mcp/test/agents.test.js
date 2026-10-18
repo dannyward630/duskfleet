@@ -98,7 +98,9 @@ test("agents can be created, updated, run and deleted over MCP without touching 
     assert.equal(run.agentId, "test-fixer");
     assert.ok(run.command.argv.includes("--allowedTools"));
     assert.ok(run.command.argv.includes("Bash(npm test:*)"));
-    assert.ok(run.command.argv.includes("--max-budget-usd") && run.command.argv.includes("1"));
+    // max_budget_usd 1 → $0.50 for the main pass, $0.50 reserve for the wrap-up pass (10% floored at $0.50, capped at half)
+    assert.equal(run.command.argv[run.command.argv.indexOf("--max-budget-usd") + 1], "0.5");
+    assert.equal(created.agent.wrapUpReserveUsd, 0.5, "list/create report the effective reserve");
 
     assert.equal(created.kind, "own");
     assert.equal(created.agent.kind, "own");
@@ -136,6 +138,26 @@ test("agents can be created, updated, run and deleted over MCP without touching 
       await client.callTool({ name: "create_agent", arguments: { id: "link-no-target", kind: "link" } }),
       /needs claude_agent/,
     );
+    // a reserve above half of the budget is refused, not silently capped (default budget is $5 when max_budget_usd is unset)
+    fails(
+      await client.callTool({
+        name: "create_agent",
+        arguments: { id: "big-reserve", kind: "own", system_prompt: "x", max_budget_usd: 1, wrap_up_reserve_usd: 2 },
+      }),
+      /cannot exceed half of the budget/,
+    );
+    fails(
+      await client.callTool({
+        name: "create_agent",
+        arguments: { id: "big-reserve", kind: "own", system_prompt: "x", wrap_up_reserve_usd: 3 },
+      }),
+      /default max budget 5/,
+    );
+    fails(
+      await client.callTool({ name: "update_agent", arguments: { id: "test-fixer", wrap_up_reserve_usd: 0.6 } }),
+      /cannot exceed half of the budget/,
+    );
+    assert.ok(!existsSync(path.join(userDir, "big-reserve.md")), "nothing written for a refused reserve");
 
     // update merges and can clear optional fields
     const updated = ok(

@@ -32,6 +32,7 @@ export const agentSpecSchema = z.object({
   effort: z.enum(EFFORT_LEVELS).optional(),
   timeout_minutes: z.number().positive().optional(),
   max_budget_usd: z.number().positive().optional(),
+  wrap_up_reserve_usd: z.number().nonnegative().optional(),
   inherit_mcp: z.boolean().optional(),
   add_dirs: z.array(z.string().min(1)).optional(),
   claude_agent: z.string().min(1).optional(),
@@ -83,6 +84,7 @@ export function agentToSpec(a: AgentDefinition): AgentSpec {
   if (a.effort !== undefined) spec.effort = a.effort;
   if (a.timeoutMinutes !== undefined) spec.timeout_minutes = a.timeoutMinutes;
   if (a.maxBudgetUsd !== undefined) spec.max_budget_usd = a.maxBudgetUsd;
+  if (a.wrapUpReserveUsd !== undefined) spec.wrap_up_reserve_usd = a.wrapUpReserveUsd;
   if (a.inheritMcp !== undefined) spec.inherit_mcp = a.inheritMcp;
   if (a.addDirs !== undefined) spec.add_dirs = a.addDirs;
   if (a.claudeAgent !== undefined) spec.claude_agent = a.claudeAgent;
@@ -170,6 +172,24 @@ export type AgentKind = "own" | "link";
 export function agentKind(a: { claudeAgent?: string | undefined } | { claude_agent?: string | undefined }): AgentKind {
   const linked = "claudeAgent" in a ? a.claudeAgent : (a as { claude_agent?: string }).claude_agent;
   return linked ? "link" : "own";
+}
+
+/**
+ * `wrap_up_reserve_usd` may take at most half of the budget (`max_budget_usd`, or the
+ * config default when the agent sets none). The run would silently cap a larger value
+ * (budgetPlan), so create/update reject it instead of reporting a different number.
+ */
+export function assertWrapUpReserve(
+  spec: Pick<AgentSpec, "max_budget_usd" | "wrap_up_reserve_usd">,
+  defaultMaxBudgetUsd: number,
+): void {
+  if (spec.wrap_up_reserve_usd === undefined) return;
+  const total = spec.max_budget_usd ?? defaultMaxBudgetUsd;
+  if (spec.wrap_up_reserve_usd > total / 2) {
+    throw new Error(
+      `wrap_up_reserve_usd (${spec.wrap_up_reserve_usd}) cannot exceed half of the budget (${spec.max_budget_usd !== undefined ? "max_budget_usd" : "default max budget"} ${total}, so at most ${Math.round((total / 2) * 100) / 100}). Lower it, raise max_budget_usd, or use 0 to disable the wrap-up pass.`,
+    );
+  }
 }
 
 /**
