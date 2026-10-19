@@ -235,6 +235,14 @@ export function getRun(id: string) {
   return { run, events: runs.events(id), resumedFrom, resumedBy };
 }
 
+/** The run's JSONL log path, only when it resolves inside `<dataDir>/logs`; null otherwise. */
+export function runLogPath(run: Run): string | null {
+  if (!run.logPath) return null;
+  const logsDir = path.resolve(config().dataDir, "logs");
+  const resolved = path.resolve(run.logPath);
+  return resolved.startsWith(`${logsDir}${path.sep}`) ? resolved : null;
+}
+
 export interface AgentStats {
   agentId: string;
   total: number;

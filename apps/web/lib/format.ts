@@ -7,13 +7,16 @@ export function fmtDuration(ms: number | null | undefined): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-/** Offset inside a run, e.g. "+0.0s", "+12.4s", "+2m 05s". */
+/** Offset inside a run as a clock, e.g. "00:00.4", "00:12.8", "05:52", "1:02:10". */
 export function fmtOffset(ms: number): string {
-  if (ms < 0) ms = 0;
-  if (ms < 60_000) return `+${(ms / 1000).toFixed(1)}s`;
-  const m = Math.floor(ms / 60_000);
-  const s = Math.round((ms % 60_000) / 1000);
-  return `+${m}m ${String(s).padStart(2, "0")}s`;
+  const clamped = Math.max(0, ms);
+  // Tenths in the first minute, where most events land within the same second.
+  if (clamped < 60_000) return `00:${(Math.floor(clamped / 100) / 10).toFixed(1).padStart(4, "0")}`;
+  const total = Math.floor(clamped / 1000);
+  const h = Math.floor(total / 3600);
+  const mm = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
 export function fmtCost(usd: number | null | undefined): string {
