@@ -69,6 +69,7 @@ login and spends nothing: the tests use the fake binary. In order:
 | Public-repo hygiene | `npm run check:public` | A versioned file contains a home path, the committing machine's user or host name, or the index holds a symlink. Placeholders `<you>`, `you`, `me` are fine. |
 | Lint + format | `npm run lint` (`biome ci .`; `npm run lint:fix` repairs) | A Biome lint error or an unformatted file. Warnings (`noNonNullAssertion`, `noExplicitAny`, …) do not block. In `packages/core` an import of the MCP SDK, React or Next.js is an error. |
 | Build | `npm run build` | `tsc` errors in core or mcp |
+| Docs sync | `npm run check:docs` (after the build: it reads `packages/mcp/dist/tools.json`) | An MCP tool the server registers has no row in `docs/mcp-server.md`, or a `docs/*.md` page is not linked from `README.md`. |
 | Typecheck | `npm run typecheck`, `npm run typecheck -w @duskfleet/web` | Type errors anywhere |
 | Tests + coverage | `npm run test:coverage` | A failing test, or line coverage of the in-process code under 80 % |
 | Dashboard build | `npm run build:web` | `next build` errors (Server Component rules `tsc` does not see) |
@@ -78,8 +79,7 @@ Two tests are gates in themselves: `test/migrations.test.js` pins the SHA-256 of
 migration (edit one and it fails; add one and it tells you the digest to append), and the layering of
 the three packages is a Biome rule, not just this page. Dependabot opens grouped weekly PRs for npm
 and GitHub Actions. Not built yet: a periodic `claude --help` flag-drift check (needs the CLI, so a
-local schedule rather than Actions), a manual-dispatch smoke run with `--model haiku`, and a docs
-sync check (every MCP tool in `docs/mcp-server.md`, every `docs/` page linked from `README.md`).
+local schedule rather than Actions) and a manual-dispatch smoke run with `--model haiku`.
 
 ## Issue and review flow by agents
 
