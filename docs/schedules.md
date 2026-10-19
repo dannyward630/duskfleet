@@ -101,6 +101,35 @@ Set it with `create_schedule` / `update_schedule` (`on_failure: resume_once | no
 the [wrap-up pass](agents.md#budget-reserve-and-wrap-up-pass): the wrap-up records where the
 run stopped, the resume picks it up from there.
 
+## Idle cost
+
+A schedule that fires every hour mostly finds nothing to do, and each of those runs still
+costs money: on 2026-10-14, 49 of 50 scheduled runs ended "nothing to do" at $0.10–0.60 each.
+Every schedule therefore reports, over the last 7 days (`idle7d` in `list_schedules` and
+`duskfleet schedules`, the **Idle · 7 d** column on the dashboard):
+
+| Field | Meaning |
+|---|---|
+| `ticks` | every time the schedule was considered (fired, skipped, error) |
+| `fires` | ticks that started a run (`started` + `resumed`) |
+| `runs`, `costUsd` | runs of the schedule and what they cost |
+| `noopRuns`, `noopCostUsd` | completed runs whose final message matched the no-op marker, and their cost |
+| `noopPattern`, `noopPatternError` | the marker used, and why it could not be parsed (else `null`; then the no-op counts are 0 for that schedule only) |
+
+The marker is `scheduler.noop_pattern` in `duskfleet.yaml` (default
+`/^\s*(nothing to do|no .* in ready)/i`, anchored at the start of the message so a run that
+did work and mentions "nothing to do" further down is not counted), overridable per schedule
+with `noop_pattern` on `create_schedule` / `update_schedule` (`clear_noop_pattern: true` goes
+back to the default). Write it as a regex literal `/…/flags` or a plain string, matched
+case-insensitively; surrounding whitespace is ignored and an empty pattern is refused. It is
+tested against the first 2000 characters of the final message only. An invalid
+`scheduler.noop_pattern` does not break the config: it is ignored with a warning and the
+default applies. `noop_pattern` and `clear_noop_pattern` in one `update_schedule` call are
+refused. Make the agent start its final message with a recognisable sentence when it finds no
+work. Failed runs, and completed runs that [need review](dashboard.md#needs-review) (a
+permission denial, a budget or context limit, an MCP mismatch), never count as no-op, even
+when they end with "nothing to do": they were blocked, not idle.
+
 ## Policies
 
 - A tick whose agent or project is still busy is recorded as `skipped_busy`, never queued.
