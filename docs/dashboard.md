@@ -57,6 +57,12 @@ in the nav); the other pages are static.
   real server) with a sticky index, plus the registration snippets for Claude Desktop and
   Claude Code with your absolute paths.
 
+A cookie-consent bar sits at the bottom of every page until you pick **Accept** or **Reject**
+(stored in the browser's `localStorage`, key `duskfleet.consent`; clear site storage to see it
+again). No analytics loads by default: GA4 is loaded only when `NEXT_PUBLIC_GA_MEASUREMENT_ID` is
+set at build time **and** the visitor accepted. With Reject, or no choice yet, no analytics
+script is requested and no analytics cookie is set.
+
 ## Needs review
 
 One rule decides what needs a human: `reviewReasons()` in core. `RunManager` applies it once,

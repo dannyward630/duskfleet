@@ -75,3 +75,4 @@ for it). `max_concurrent_runs` always stays the hard cap. See
 | `DUSKFLEET_CONFIG` | Directory containing `duskfleet.yaml` (default: the closest ancestor `config/` of the running package / cwd) |
 | `CLAUDE_BIN` | Path to the Claude Code binary (overrides `claude.binary`). Read by DuskFleet only: it is not passed on to agent runs. |
 | `DUSKFLEET_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` |
+| `NEXT_PUBLIC_GA_MEASUREMENT_ID` | Dashboard only, read at build time: GA4 measurement id. Unset (the default) = no analytics at all; set = GA4 loads only after the visitor accepts in the cookie banner ([Dashboard](dashboard.md)) |

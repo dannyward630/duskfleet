@@ -4,6 +4,8 @@ import type { Metadata } from "next";
 import { IBM_Plex_Mono, IBM_Plex_Sans, Outfit } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
+import { Analytics } from "@/components/Analytics";
+import { CookieBanner } from "@/components/CookieBanner";
 import { NavTabs } from "@/components/NavTabs";
 import { schedulerEnabled, schedulerLease } from "@/lib/data";
 
@@ -70,6 +72,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           </nav>
           {children}
         </div>
+        <CookieBanner />
+        <Analytics />
       </body>
     </html>
   );
