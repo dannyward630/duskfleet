@@ -5,6 +5,12 @@ next-env.d.ts
 data/
 *.tsbuildinfo
 *.log
+*.tgz
+
+# copies made by scripts/assemble-package.mjs for npm pack
+packages/duskfleet/README.md
+packages/duskfleet/LICENSE
+apps/web/LICENSE
 .DS_Store
 
 # machine-specific MCP registration; copy from .mcp.json.example

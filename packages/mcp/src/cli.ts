@@ -42,8 +42,9 @@ function print(value: unknown): void {
   process.stdout.write(JSON.stringify(value, null, 2) + "\n");
 }
 
-function usage(): never {
-  process.stderr.write(
+/** Usage on stderr with exit 2 (a wrong invocation), or on stdout with exit 0 when asked for (`--help`). */
+function usage(asked = false): never {
+  (asked ? process.stdout : process.stderr).write(
     [
       "Duskfleet - A fleet of agents for your own machine.",
       "",
@@ -64,10 +65,11 @@ function usage(): never {
       "  duskfleet install-service [--print]",
       "  duskfleet uninstall-service",
       "  duskfleet doctor [--probe]",
+      "  duskfleet --help",
       "",
     ].join("\n"),
   );
-  process.exit(2);
+  process.exit(asked ? 0 : 2);
 }
 
 /** What the service runs: this node, this dist/cli.js, this repo, the resolved claude binary. */
@@ -87,6 +89,8 @@ function serviceTarget(claudeBin: string | null, dataDir: string): ServiceTarget
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   if (!command) usage();
+  // Before bootstrap: help must work without a config (a fresh `npx duskfleet --help`).
+  if (command === "--help" || command === "-h" || command === "help") usage(true);
   if (command === "tools") {
     print(await buildToolCatalog());
     return;
