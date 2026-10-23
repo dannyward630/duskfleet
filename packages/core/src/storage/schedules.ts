@@ -273,12 +273,14 @@ export class ScheduleRepository {
   /**
    * Put a pending deferred fire back after a retry that was busy again, only if nothing is pending
    * now: a fresher pending recorded meanwhile (the due loop deferring the next occurrence while
-   * this retry's gate ran) wins over the stale one. True when it was put back.
+   * this retry's gate ran) wins over the stale one. Never onto a paused schedule: a pause during the
+   * retry's gate cleared the pending, and a paused schedule never starts from one. True when it was
+   * put back.
    */
   restoreDeferred(id: string, until: string, reason: string): boolean {
     const r = this.db
       .prepare(
-        "UPDATE schedules SET deferred_until = ?, deferred_reason = ?, updated_at = ? WHERE id = ? AND deferred_until IS NULL",
+        "UPDATE schedules SET deferred_until = ?, deferred_reason = ?, updated_at = ? WHERE id = ? AND deferred_until IS NULL AND enabled = 1",
       )
       .run(until, reason, new Date().toISOString(), id);
     return Number(r.changes) > 0;

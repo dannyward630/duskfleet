@@ -1621,6 +1621,52 @@ test("defer_busy: a gated retry that outlasts its occurrence never writes a stal
   }
 });
 
+test("defer_busy: a schedule paused during a gated retry that ends busy gets no stale pending back", async () => {
+  const { root, configDir } = makeDeferRoot();
+  const t = makeScheduler(configDir);
+  let blockerRun = null;
+  try {
+    const s = t.scheduler.create({
+      name: "paused retry",
+      agentId: "gatekeeper",
+      prompt: "ok",
+      cron: "0 3 * * *",
+      gate: { command: "sleep 1; exit 0", timeoutSeconds: 10 },
+    });
+    const staleUntil = new Date(Date.now() + 3_600_000).toISOString();
+    t.db
+      .prepare("UPDATE schedules SET deferred_until = ?, deferred_reason = ? WHERE id = ?")
+      .run(staleUntil, "project busy: an earlier tick", s.id);
+
+    // The retry takes the pending and runs its gate; meanwhile the schedule is paused and the
+    // project gets busy, so the retry ends busy.
+    await t.scheduler.tick();
+    t.scheduler.update(s.id, { enabled: false });
+    blockerRun = (await t.runs.startRun({ prompt: "hang", agentId: "blocker" })).id;
+    await t.scheduler.settled();
+    let row = t.repo.get(s.id);
+    assert.equal(row.enabled, false);
+    assert.equal(row.deferredUntil, null, "the stale pending is not written back onto the paused schedule");
+    assert.equal(row.deferredReason, null);
+
+    // Resumed before the old deadline: nothing pending, so nothing fires on top of the cron occurrence.
+    t.runs.cancelRun(blockerRun);
+    blockerRun = null;
+    t.scheduler.update(s.id, { enabled: true });
+    await t.tickAll();
+    row = t.repo.get(s.id);
+    assert.equal(row.deferredUntil, null);
+    assert.equal(
+      t.repo.firings(s.id).some((f) => f.outcome === "started"),
+      false,
+      "a paused schedule never starts from a pending",
+    );
+  } finally {
+    if (blockerRun) t.runs.cancelRun(blockerRun);
+    await t.close(root);
+  }
+});
+
 test("defer_busy: daily cap skips are not deferred; turning defer_busy off settles a pending as skipped_busy", async () => {
   const { root, configDir } = makeDeferRoot();
   writeFileSync(path.join(configDir, "agents", "once.md"), `---\nproject: demo\nmax_daily_runs: 1\n---\nOnce.\n`);

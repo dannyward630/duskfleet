@@ -229,7 +229,8 @@ the smallest form instead. With `scheduler.defer_busy: true` (the default, in `d
 - Every tick retries it (busy check first, then the gate if any). A retry that is busy again
   writes nothing: one busy spell is one `deferred` row, not one per tick (only a retry whose
   gate ran and was refused afterwards adds a `deferred` row carrying the gate's cost, so the
-  gate spend stays counted). It is put back only if nothing newer is pending. When the guard has
+  gate spend stays counted). It is put back only if nothing newer is pending and the schedule
+  was not paused meanwhile. When the guard has
   cleared the fire starts as usual (`started` or `resumed`, the run carries the `scheduleId`)
   and `next_run_at` is not moved (re-read at that moment: a long gate never writes back an
   occurrence that was claimed meanwhile).
