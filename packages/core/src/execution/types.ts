@@ -3,7 +3,8 @@
  * uses to run an agent. `ClaudeCodeExecutor` is the one implementation today.
  */
 import type { EffortLevel, PermissionMode } from "../config/types.js";
-import type { RecordedCommand } from "../observability/run.js";
+import type { FailureClassification } from "../observability/failure.js";
+import type { BillingType, RecordedCommand } from "../observability/run.js";
 
 export interface ExecutionRequest {
   /** Working directory for the child process. Must already be validated. */
@@ -26,6 +27,13 @@ export interface ExecutionRequest {
   maxBudgetUsd?: number;
   /** Drop --strict-mcp-config so the run sees the user's MCP servers (claude.ai connectors, .mcp.json). */
   inheritMcp?: boolean;
+  /**
+   * Server prefixes (`mcp__claude_ai_Figma`) the run needs. When the child's `init` line reports
+   * no server of a prefix, the process is ended and started again, once: Claude Code sometimes
+   * comes up without any claude.ai connector (3 runs out of 12 on 2026-10-20), and `init` is
+   * printed before the first model turn, so the restart costs seconds, not dollars.
+   */
+  requiredMcpServers?: string[];
   /** Passed as --add-dir. */
   addDirs?: string[];
   /** Passed as --agent: adopt a project-defined Claude Code agent. */
@@ -54,6 +62,18 @@ export type ExecutionEvent =
   | { type: "subagent_start"; subagent: SubagentRecord }
   | { type: "subagent_end"; subagent: SubagentRecord }
   | { type: "stderr"; text: string }
+  /**
+   * The process (or a descendant holding its stdio, such as a user-level Stop hook) was still
+   * running `afterMs` after the result line, so its process group was sent SIGTERM (SIGKILL
+   * after the kill grace). `childAlive` is false when only descendants were left.
+   */
+  | { type: "grace_kill"; pid: number | null; afterMs: number; childAlive: boolean }
+  /**
+   * The first process reported `init` without a required MCP server (`missing`, prefixes;
+   * `mounted`, the names it did report) and was replaced by a fresh one (`pid`, `sessionId`).
+   * At most once per run; the second process is kept whatever its init says.
+   */
+  | { type: "mcp_restart"; missing: string[]; mounted: string[]; pid: number | null; sessionId: string }
   | { type: "parse_error"; line: string };
 
 export type SubagentStatus = "running" | "completed" | "failed" | "interrupted";
@@ -102,6 +122,12 @@ export interface TokenUsage {
   cacheCreationTokens: number | null;
 }
 
+/** Token usage keyed by model id, as the result line's `modelUsage` reports it. */
+export type UsageByModel = Record<string, TokenUsage>;
+
+/** `modelUsed` of a run whose tokens were spent on more than one model (subagents). */
+export const MIXED_MODEL = "mixed";
+
 export type ExecutionOutcome = "completed" | "failed" | "cancelled" | "timed_out";
 
 export interface McpServerInfo {
@@ -139,12 +165,17 @@ export interface ExecutionResult {
   resultText: string | null;
   numTurns: number | null;
   toolCalls: number;
+  /** Run totals: the sum of `usageByModel` when known, else the result line's `usage`. */
   usage: TokenUsage;
+  /** Per model, from the result line's `modelUsage`; null when it had none. */
+  usageByModel: UsageByModel | null;
   costUsd: number | null;
   permissionDenials: number;
   deniedTools: DeniedTool[];
   /** Heuristic: the run stopped because the context window was exhausted. */
   contextExhausted: boolean;
+  /** Why the run failed, as a code (`classifyFailure`); null when unknown or when it did not fail. */
+  failure: FailureClassification | null;
   /** Full raw result object from the tool, for later analysis. */
   rawResult: unknown;
   /** Subagent invocations observed in the stream, in start order. */
@@ -154,6 +185,8 @@ export interface ExecutionResult {
 export interface ExecutionHandle {
   command: RecordedCommand;
   pid: number | null;
+  /** From the environment the child was spawned with; executors that cannot tell leave it out. */
+  billingType?: BillingType;
   done: Promise<ExecutionResult>;
   cancel(): void;
 }

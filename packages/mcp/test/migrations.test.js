@@ -20,6 +20,16 @@ const SHIPPED = [
   { version: 8, sha256: "46ba5171a209ea14130a172a505b7188af26f95e024a107764aa0c1240bd96af" },
   { version: 9, sha256: "ca678b0e4e98c1baefd986778b329fa8f870650f8441d3ec39abbac6702a6f85" },
   { version: 10, sha256: "2e76d46da90a55c06ca8e6298f95e54fb94de3d479ac13973dc8543a0d348112" },
+  { version: 11, sha256: "af336cc559b3e0663276d53ccd3e292f4ae8e402031fe13f23a4ad45158de448" },
+  { version: 12, sha256: "c294406e3c2a07d81709a588bf76cf4f956ce9263d4edd550bddac74d8029ad9" },
+  { version: 13, sha256: "92773f05128dd2ff416b962b67b4e33ec585422b7d804611c5de8219e45075e5" },
+  { version: 14, sha256: "ccbcf51e17e27bd962e1d488a3c43649e6a594283cf428f8cbe3f9f7291985d4" },
+  { version: 15, sha256: "b9a15fcd5ece973003cdec2c1a1e3a6e9052f0967a24b81e2b84811269099452" },
+  { version: 16, sha256: "bde316636bbbc0a097aa8d9921df4c5f983ff70ee45112bf9511f49a7a4cc1c6" },
+  { version: 17, sha256: "79a2323b8639caebb19f9aa4208cd29fdf1ed04439ebf11d73a832b3a10ffe03" },
+  { version: 18, sha256: "2fc1eb7e77a4ebb1a88a058224da762ab54f6b383a70d3a87b940462108018c0" },
+  { version: 19, sha256: "725011afa3141e0d80a266b7770d0cee55eed2ab89137aadef957826a3573767" },
+  { version: 20, sha256: "61b3fb50d80ed13caa40bed44a70030972cad483b19d3b8cc07b30983a579cc3" },
 ];
 
 test("shipped migrations are never edited, only appended to", () => {

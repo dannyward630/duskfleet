@@ -39,7 +39,8 @@ packages/core/src/index.ts       public API of @duskfleet/core
 packages/mcp/src/mcp             MCP server + tools (one file per tool group)
 packages/mcp/src/cli.ts          local CLI
 packages/mcp/src/index.ts        MCP server entry point
-packages/mcp/test                fake Claude binary + tests
+packages/core/test               unit tests of core modules (nothing spawned)
+packages/mcp/test                fake Claude binary + end-to-end tests
 apps/web/app                     Next.js routes: /, /agents, /runs/[id], /schedules, /mcp
 apps/web/lib/data.ts             server-only read access to config + SQLite
 ```
@@ -49,9 +50,16 @@ apps/web/lib/data.ts             server-only read access to config + SQLite
 ```bash
 npm run build          # core + mcp (tsc). The CLI, the MCP server and the dashboard import from dist/
 npm run typecheck      # core + mcp; dashboard: npm run typecheck -w @duskfleet/web
-npm test               # packages/mcp/test/*.test.js, node --test, ~25 s, no network, no cost
+npm test               # packages/core/test, then packages/mcp/test; node --test, ~25 s, no network, no cost
+npm test -w @duskfleet/core   # core unit tests alone, under a second
 npm run check          # everything CI runs, in the same order (hygiene, lint, build, typecheck, tests)
 ```
+
+One home per module: a test that only calls core functions (state machine, loader, parser, cron,
+tool summaries) lives in `packages/core/test` and imports `@duskfleet/core`; a test that needs the
+CLI, the MCP server or a spawned fake Claude lives in `packages/mcp/test`. Both import the built
+`dist/`, so run `npm run build` first. `npm run test:coverage` runs both suites in one process set,
+so the 80 % gate still counts the core tests.
 
 The tests use `packages/mcp/test/fake-claude.js`, a stand-in for the Claude binary that replays
 the real `stream-json` event shapes, so they never launch a real Claude. They cover the
@@ -61,7 +69,9 @@ MCP server driven over stdio. Add a case to the fake binary when the parser lear
 ## Quality gates
 
 Every pull request runs the `checks` job in `.github/workflows/ci.yml`; a ruleset on `main` refuses
-the merge while it is red, and refuses pushes that bypass a pull request. The job needs no Claude
+the merge while it is red, refuses pushes that bypass a pull request, and requires a review from a
+code owner (`.github/CODEOWNERS`: the maintainer owns every file, so a community pull request merges only
+once they approve it; repository admins may bypass that requirement for their own pull requests). The job needs no Claude
 login and spends nothing: the tests use the fake binary. In order:
 
 | Step | Command | Fails when |
@@ -69,7 +79,7 @@ login and spends nothing: the tests use the fake binary. In order:
 | Public-repo hygiene | `npm run check:public` | A versioned file contains a home path, the committing machine's user or host name, or the index holds a symlink. Placeholders `<you>`, `you`, `me` are fine. |
 | Lint + format | `npm run lint` (`biome ci .`; `npm run lint:fix` repairs) | A Biome lint error or an unformatted file. Warnings (`noNonNullAssertion`, `noExplicitAny`, …) do not block. In `packages/core` an import of the MCP SDK, React or Next.js is an error. |
 | Build | `npm run build` | `tsc` errors in core or mcp |
-| Docs sync | `npm run check:docs` (after the build: it reads `packages/mcp/dist/tools.json`) | An MCP tool the server registers has no row in `docs/mcp-server.md`, or a `docs/*.md` page is not linked from `README.md`. |
+| Docs sync | `npm run check:docs` (after the build: it reads `packages/mcp/dist/tools.json`) | An MCP tool the server registers has no row in `docs/mcp-server.md`, a `ScheduleOutcome` value is not listed there, or a `docs/*.md` page is not linked from `README.md`. |
 | Typecheck | `npm run typecheck`, `npm run typecheck -w @duskfleet/web` | Type errors anywhere |
 | Tests + coverage | `npm run test:coverage` | A failing test, or line coverage of the in-process code under 80 % |
 | Dashboard build | `npm run build:web` | `next build` errors (Server Component rules `tsc` does not see) |
@@ -78,13 +88,14 @@ login and spends nothing: the tests use the fake binary. In order:
 Two tests are gates in themselves: `test/migrations.test.js` pins the SHA-256 of every shipped
 migration (edit one and it fails; add one and it tells you the digest to append), and the layering of
 the three packages is a Biome rule, not just this page. Dependabot opens grouped weekly PRs for npm
-and GitHub Actions. Not built yet: a periodic `claude --help` flag-drift check (needs the CLI, so a
+and GitHub Actions. Workflows pin every action by full commit SHA with a version comment
+(`uses: actions/checkout@<sha> # v7.0.1`); Dependabot bumps the SHA and the comment together. Not built yet: a periodic `claude --help` flag-drift check (needs the CLI, so a
 local schedule rather than Actions) and a manual-dispatch smoke run with `--model haiku`.
 
 ## Issue and review flow by agents
 
-The owner runs a development loop over this repository's own issues and PRs with two local
-Claude Code agents and three local skills (`.claude/` is git-ignored: agents, skills and
+The owner runs a development loop over this repository's own issues and PRs with three local
+Claude Code agents and four local skills (`.claude/` is git-ignored: agents, skills and
 settings stay on the machine). A DuskFleet run loads the project's skills (verified with Claude
 Code 2.1.302: `--permission-prompts none` with `--setting-sources project,local` still mounts
 `.claude/skills` and the built-in skills), so an agent only needs `Skill` in its
@@ -95,13 +106,29 @@ Issues carry the development state, PRs carry the review state, and each agent f
 work from a label query when its schedule wakes it:
 
 ```
-issue:  flow: ready ──(developer picks, swaps the label first)──► flow: in-progress ──► closed by the merge
+issue:  priority: * ──(planner, when unblocked)──► flow: ready ──(developer picks, swaps the label first)──► flow: in-progress ──► closed by the merge
 PR:     flow: needs-review ──► flow: in-review ──► flow: changes-requested ──► flow: needs-review … ──► flow: ready-to-merge
 ```
 
-- A human labels at most a handful of issues `flow: ready` (and sets `priority:` labels; the
-  developer takes `priority: high` first, then oldest). `flow: needs-human` parks anything the
-  loop cannot decide; `flow: ready-to-merge` means a human merges — agents never do.
+- A human writes issues and sets their `priority:` labels; a priority is the consent for an
+  issue to be developed. The planner fills the `flow: ready` queue from them (below), and a
+  human can still label an issue `flow: ready` by hand. The developer takes `priority: high`
+  first, then oldest. `flow: needs-human` parks anything the loop cannot decide;
+  `flow: ready-to-merge` means a human merges — agents never do.
+- The planner runs twice a day, read-only on files. `node scripts/issue-plan.mjs` prints a JSON
+  snapshot of the flow (labels, declared blockers and whether they are still open, the open PRs
+  closing each issue, a ranked candidate list); the agent then declares missing dependencies,
+  parks issues that need a decision with `flow: needs-human`, and promotes candidates to
+  `flow: ready` up to six, at most two units of work in flight per area, and none while eight
+  PRs wait for a merge. It never promotes an issue without a `priority:` label, a `roadmap`
+  issue, one that already has an open PR, or an `area: website` issue: the public site
+  (`duskfleet-website`) is the owner's work, and the developer agents of this repository
+  would build it into the dashboard.
+- Dependencies are lines in an issue's body or comments: `Blocked by #65` (or
+  `Depends on #62, #61`). While one of them is open the issue carries the `blocked` label and
+  stays out of the queue; the planner removes the label once all of them are closed. A
+  `blocked` label without such a line is a human's and is left alone. To drop a dependency,
+  delete the line (the planner's are comments starting with `[df-planner]`).
 - The developer does one unit of work per run, rework before new work: a PR labelled
   `flow: changes-requested` (or, as a fallback, an unlabelled PR with unresolved review
   threads) is fixed in a worktree on the PR branch (`scripts/pr-worktree.sh <name> <branch>
@@ -111,23 +138,90 @@ PR:     flow: needs-review ──► flow: in-review ──► flow: changes-req
   with `flow: needs-review`. Each pickup swaps the label first, as a lock against a second run.
 - The reviewer picks the oldest PR labelled `flow: needs-review` (fallback: the oldest open PR
   without a `VERDICT:` comment naming its current head SHA), swaps it to `flow: in-review`,
-  runs the built-in `code-review` skill with `--comment` (inline correctness findings), then
-  checks the rules of CLAUDE.md — and, for a PR that closes an issue, the issue's own
-  acceptance criteria — and posts one summary comment ending with `VERDICT: approve` or
-  `VERDICT: changes`. The verdict's label (`flow: ready-to-merge` or `flow: changes-requested`)
-  is the hand-off. Read-only agent; after three `VERDICT: changes` rounds it parks the PR with
-  `flow: needs-human`.
+  runs a correctness pass through a subagent with a fixed brief (it posts the findings that
+  hold as inline comments), then checks the rules of CLAUDE.md — and, for a PR that closes an
+  issue, the issue's own acceptance criteria — and posts one summary comment ending with
+  `VERDICT: approve` or `VERDICT: changes`. The verdict's label (`flow: ready-to-merge` or
+  `flow: changes-requested`) is the hand-off. Read-only agent; after three `VERDICT: changes`
+  rounds it parks the PR with `flow: needs-human`. The built-in `code-review` skill is not
+  used unattended: its fork gathers context with commands no allow-list can permit
+  (`git diff @{upstream}...HEAD`, `;` chains), so it was denied in most runs.
+- Dependabot PRs take a short path instead of the two passes: all checks green, only manifests,
+  lockfile or workflow files changed, no added dependency, no major bump (and `@types/node`
+  on the Node floor's major) → `flow: ready-to-merge`; a red check or a bump outside those
+  bounds → `flow: changes-requested`, and a wanted major → `flow: needs-human`. Still a
+  review: grouped bumps have broken the web build before.
 
-The DuskFleet side is a pair of user agents in `data/agents/` that link the local Claude Code
-agents (`claude_agent`) and add only the unattended envelope: permission mode, `gh` / `git` /
-`npm` allow-list, budget and timeout — plus one cron schedule per agent, staggered so a PR
-opened by the developer meets the reviewer within the hour. A busy agent makes a tick skip
+- The PR gate keeps the labels true to the merge state, with no agent involved. A PR labelled
+  `flow: needs-review` or `flow: ready-to-merge` was fine when it got the label; once `main`
+  moves it can conflict, and the ruleset on `main` requires an up-to-date branch with a green
+  `checks` job. `node scripts/pr-gate.mjs [--dry-run] [--update-branch]` reads every open PR
+  in those two states (drafts and Dependabot excluded) and, when it conflicts with its base or
+  a required check (read from the rulesets on the base branch; a failed non-required job such
+  as `sync` does not count) failed on its head, swaps the label to `flow: changes-requested`
+  and then posts one comment starting with `[pr-gate]` (head SHA and the reasons; it is
+  written last, so a failed label call is retried on the next run). One failing PR does not
+  stop the others; the script exits non-zero at the end. The developer's next run merges
+  the base into the branch or fixes the check, and hands the PR back to the reviewer as after
+  any review. A PR that is merely behind its base is updated in place with `--update-branch`.
+  Idempotent: a head that already carries a `[pr-gate]` comment is left alone, so a human can
+  overrule the gate by relabelling. The workflow `.github/workflows/pr-gate.yml` runs it on
+  every push to `main`, after every CI run, once an hour and on demand. With the repository
+  secret `PR_GATE_TOKEN` (a user token with write access; scopes in the workflow header) it
+  also updates branches and its label changes fire the project sync; with the default token it
+  only relabels, since a push or a label set by `GITHUB_TOKEN` starts no other workflow. The
+  reviewer checks the same state before and after its passes (`gh pr view <n> --json
+  mergeable,statusCheckRollup`): a conflicting or red PR gets `VERDICT: changes` without a
+  review.
+- The gate also expires stale locks. `flow: in-progress` and `flow: in-review` are swapped in
+  first as a lock against a second run; a run that dies after that (timeout, killed child, an
+  ending such as "tests are running, I'll pick up when they finish") leaves the lock behind,
+  every later run skips the item as someone else's and nothing in the flow looks at it again
+  (PR #164 sat `in-progress` for 17 hours with no push). No run outlives its timeout, so a lock
+  older than `--stale-hours` (default 2, above the longest agent timeout) with no activity since
+  it was set is an orphan and goes back to the state it was taken from: a PR `in-progress` with
+  no commit on its head since the label to `flow: changes-requested`; a PR `in-review` with no
+  `VERDICT:` for its head since the label to `flow: needs-review` (a verdict posted but never
+  labelled gets its label instead, no second review, but only once the lock is that old too, so
+  a live reviewer between its comment and its label swap is never raced; the verdict counts
+  only at the start of a line); an issue `in-progress` with no open PR
+  closing it to `flow: ready`. Each gets a `[pr-gate]` comment naming the lock and its age. A
+  pickup is a new label event, so the clock restarts and a run still at work is never
+  interrupted. Agents keep their side of it: swap the label first, push or post before the
+  timeout, never end a run with work "still running in the background".
+
+The DuskFleet side is three user agents in `data/agents/` (developer, reviewer, planner) that
+link the local Claude Code agents (`claude_agent`) and add only the unattended envelope:
+permission mode, `gh` / `git` / `npm` allow-list, budget and timeout — plus one cron schedule
+per agent, staggered so a PR opened by the developer meets the reviewer within the hour and a
+planner run lands just before a developer tick. A busy agent makes a tick skip
 (`skipped_busy`), never queue. See `docs/agents.md` and `docs/schedules.md`.
+
+The GitHub Project "DuskFleet Flow" (org project 2) is a read-only mirror of the labels:
+`node scripts/project-sync.mjs [--repo <owner/name>]... [--dry-run]` adds every open issue and
+PR of the given repositories (the current one by default) to the project (the project's
+auto-add workflow covers the issues of this repository only) and sets each item's Status from
+its `flow:` label (`Backlog` without one, `Done` when closed or merged). The website repository
+shares the board, so the workflow passes both. Labels stay the source of truth:
+agents never touch the project, and a Status dragged on the board is overwritten on the next
+sync. Its views: *Board* (open items by Status, Backlog hidden), *Backlog* (open issues with no
+`flow:` label, to pick what to promote), *Needs me* (`Ready to merge` and `Needs human`, the two
+states that wait for a human), *All*. Run by hand, the script needs the `project` scope once
+(`gh auth refresh -h github.com -s project`). The workflow `.github/workflows/project-sync.yml`
+runs it on every open / close / label change of an issue or PR, once an hour as a safety net
+and on demand (*Actions → Project sync → Run workflow*); it needs the repository secret
+`PROJECT_SYNC_TOKEN` (the default token cannot touch an organization project; the scopes are
+listed in the workflow header). Without the secret the job fails loudly and the board simply
+lags until the script is run by hand. The website repository carries a copy of the workflow
+that checks out this repository for the script, so its own label changes reach the board at
+once instead of on the next hourly run; it needs the same secret there.
 
 ## Security model
 
 - The project path is passed as the child's **working directory**; nothing is ever built into a
   shell string (`spawn(binary, argv, { shell: false })`).
+- The prompt is written to the child's **stdin**, never passed as an argument: it does not show
+  up in `ps` output nor in the recorded command, only in the run's `prompt` column.
 - Project paths are validated before anything runs; `allowed_project_roots` fences them.
 - Permission mode is explicit per agent; `bypassPermissions` is off unless enabled in config.
 - Every run stores the full command it executed.
@@ -137,7 +231,8 @@ opened by the developer meets the reviewer within the hour. A busy agent makes a
 ## Extending
 
 - **New MCP tool**: add a file in `packages/mcp/src/mcp/tools/`, register it in `packages/mcp/src/mcp/server.ts`.
-- **New builtin agent**: drop a Markdown file in `config/agents/`.
+- **New builtin agent**: drop a Markdown file in `config/agents/` and list it under "Builtin
+  agents" in `docs/agents.md`. Builtins are general-purpose (no `project:`, no personal paths).
 - **Schema change**: append a migration in `packages/core/src/storage/db.ts`; never edit an existing one. Then pin its digest in `packages/mcp/test/migrations.test.js` (the failing test prints it).
 - **Run status changes**: only `RunManager`, through `assertTransition`.
 - **New dashboard view**: add a route under `apps/web/app/` and a query in `apps/web/lib/data.ts`.
@@ -147,7 +242,7 @@ opened by the developer meets the reviewer within the hour. A busy agent makes a
 
   | Flag | Purpose in DuskFleet |
   |---|---|
-  | `-p, --print` | Non-interactive execution |
+  | `-p, --print` | Non-interactive execution; with no positional prompt it reads the prompt from stdin (`--input-format` defaults to `text`), which is how the executor sends it |
   | `--output-format stream-json` + `--verbose` | Line-delimited JSON events (`stream-json` refuses to run without `--verbose`) |
   | `--session-id <uuid>` | The run knows its session id before the process starts |
   | `--model <model>` | Only passed when explicitly selected |

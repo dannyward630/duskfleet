@@ -12,15 +12,27 @@ import { fileURLToPath } from "node:url";
  *   duskfleet run-info <run_id> [--events]
  *   duskfleet repair-subagents # backfill subagent rows of finished runs from their logs
  *   duskfleet schedules
- *   duskfleet tools            # MCP tool catalogue (names, descriptions, input schemas)
+ *   duskfleet schedules run-now <id or name>   # stamp run_requested_at; the lease holder fires it next tick
+ *   duskfleet budgets [set <global | agent <id> | project <id>> --amount <usd> [--warn <pct>] [--no-hard-stop] | delete <id>]
+ *   duskfleet tools           # MCP tool catalogue (names, descriptions, input schemas)
  *   duskfleet serve            # long-running scheduler process (what the service runs)
  *   duskfleet install-service [--print]   # register `serve` with launchd / systemd --user / Task Scheduler
  *   duskfleet uninstall-service
  *   duskfleet doctor           # also reports the service and who holds the scheduler lease
+ *   duskfleet doctor --probe   # plus one real hello run on haiku (costs cents): auth, blocking hooks
  */
 import { parseArgs } from "node:util";
-import { findRepoRoot, parseHolder, RUN_STATUSES, type RunStatus, subagentView, summarizeRun } from "@duskfleet/core";
+import {
+  type BudgetInput,
+  findRepoRoot,
+  parseHolder,
+  RUN_STATUSES,
+  type RunStatus,
+  subagentView,
+  summarizeRun,
+} from "@duskfleet/core";
 import { bootstrap } from "./bootstrap.js";
+import { PROBE_COST_NOTE, type ProbeReport, probeNotRun, runProbe } from "./probe.js";
 import { installService, renderService, type ServiceTarget, serviceStatus, uninstallService } from "./service.js";
 import { buildToolCatalog } from "./tools-catalog.js";
 
@@ -39,11 +51,15 @@ function usage(): never {
       "  duskfleet run-info <run_id> [--events]",
       "  duskfleet repair-subagents",
       "  duskfleet schedules",
+      "  duskfleet schedules run-now <schedule id or name>",
+      "  duskfleet budgets",
+      "  duskfleet budgets set <global | agent <id> | project <id>> --amount <usd> [--warn <percent>] [--no-hard-stop]",
+      "  duskfleet budgets delete <budget id>",
       "  duskfleet tools",
       "  duskfleet serve",
       "  duskfleet install-service [--print]",
       "  duskfleet uninstall-service",
-      "  duskfleet doctor",
+      "  duskfleet doctor [--probe]",
       "",
     ].join("\n"),
   );
@@ -117,6 +133,10 @@ async function main(): Promise<void> {
       return done();
     }
     case "doctor": {
+      const { values: doctorFlags } = parseArgs({
+        args: rest,
+        options: { probe: { type: "boolean", default: false } },
+      });
       let version: string | null = null;
       let error: string | null = null;
       try {
@@ -141,6 +161,29 @@ async function main(): Promise<void> {
               ? `schedules fire only while an MCP host keeps the server alive${leaseLive ? "" : " (nothing is ticking right now)"}; run "duskfleet install-service" to run them unattended`
               : service.detail,
       };
+      // Opt-in live run: the only part of doctor that costs money, so say so before spending it.
+      let probe: ProbeReport | null = null;
+      if (doctorFlags.probe && error) {
+        process.stderr.write("doctor --probe skipped: claude --version failed, fix that first (nothing was spent)\n");
+        probe = probeNotRun(
+          "skipped",
+          "claude --version failed",
+          "the probe did not run because claude --version failed; fix the binary (see error) and probe again",
+        );
+      } else if (doctorFlags.probe) {
+        process.stderr.write(`${PROBE_COST_NOTE}...\n`);
+        try {
+          probe = await runProbe(app.executor, app.config.claude);
+          // Ctrl-C / kill: the paid child is cancelled and the temp dir gone; no report.
+          if (probe.outcome === "interrupted") return done(130);
+        } catch (err) {
+          probe = probeNotRun(
+            "error",
+            String(err),
+            "the probe could not run (see probe.error); this is a local problem, not a Claude result",
+          );
+        }
+      }
       print({
         node: process.version,
         claudeBinary: app.executor.binary,
@@ -150,8 +193,9 @@ async function main(): Promise<void> {
         dataDir: app.config.dataDir,
         agents: [...app.config.agents.keys()],
         scheduler,
+        ...(doctorFlags.probe ? { probe } : {}),
       });
-      return done(error ? 1 : 0);
+      return done(error || (probe && !probe.ok) ? 1 : 0);
     }
     case "run": {
       const { values, positionals } = parseArgs({
@@ -199,7 +243,64 @@ async function main(): Promise<void> {
       return done();
     }
     case "schedules": {
+      const [sub, target] = rest;
+      if (sub === "run-now") {
+        if (!target) usage();
+        // Only stamps run_requested_at: the lease holder (normally the service) fires the
+        // schedule on its next tick. Nothing is spawned here, so this is the command to call
+        // from a git hook or any script that must return at once (`run --no-wait` would exit
+        // before the run's stream is read).
+        const schedule = app.scheduler.requestRun(target);
+        if (!schedule) {
+          process.stderr.write(`schedule not found: ${target}\n`);
+          return done(1);
+        }
+        const lease = app.scheduler.status().lease;
+        const leaseLive = lease ? new Date(lease.expiresAt).getTime() > Date.now() : false;
+        process.stderr.write(
+          leaseLive
+            ? `schedule "${schedule.name}" requested; ${lease!.holder} fires it within ${app.config.scheduler.tickSeconds}s\n`
+            : `schedule "${schedule.name}" requested, but nothing is ticking: it fires when a scheduler starts (duskfleet serve / install-service)\n`,
+        );
+        print(schedule);
+        return done();
+      }
+      if (sub) usage();
       print({ scheduler: app.scheduler.status(), schedules: app.scheduler.listWithLastRun() });
+      return done();
+    }
+    case "budgets": {
+      const [sub, ...args] = rest;
+      if (sub === "set") {
+        const { values, positionals } = parseArgs({
+          args,
+          allowPositionals: true,
+          options: {
+            amount: { type: "string" },
+            warn: { type: "string" },
+            "no-hard-stop": { type: "boolean", default: false },
+          },
+        });
+        const [scope, scopeId] = positionals;
+        if (!scope || !values.amount) usage();
+        const input: BudgetInput = { scope: scope as BudgetInput["scope"], amountUsd: Number(values.amount) };
+        if (scopeId) input.scopeId = scopeId;
+        if (values.warn) input.warnPercent = Number(values.warn);
+        if (values["no-hard-stop"]) input.hardStop = false;
+        print(app.runs.setBudget(input));
+        return done();
+      }
+      if (sub === "delete") {
+        if (!args[0]) usage();
+        if (!app.runs.deleteBudget(args[0])) {
+          process.stderr.write(`budget not found: ${args[0]}\n`);
+          return done(1);
+        }
+        print({ deleted: true });
+        return done();
+      }
+      if (sub) usage();
+      print(app.runs.budgetStatuses());
       return done();
     }
     case "serve": {
@@ -239,7 +340,8 @@ async function main(): Promise<void> {
         return done(1);
       }
       const subagents = app.runs.agents(id).map((s) => subagentView(s)); // same names as get_run
-      print(values.events ? { ...run, subagents, events: app.runs.events(id) } : { ...run, subagents });
+      const diff = app.runs.diff(id); // same field as get_run
+      print(values.events ? { ...run, diff, subagents, events: app.runs.events(id) } : { ...run, diff, subagents });
       return done();
     }
     case "repair-subagents": {

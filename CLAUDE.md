@@ -13,8 +13,10 @@ npm install --cache "$TMPDIR/npm-cache"   # ~/.npm has root-owned files on this 
 npm run build        # core + mcp (tsc). Run after every change under packages/: the CLI,
                      # the MCP server and the dashboard all import from dist/
 npm run typecheck    # core + mcp;  web: npm run typecheck -w @duskfleet/web
-npm test             # packages/mcp/test/*.test.js, node --test, ~25 s, no network, no cost
+npm test             # packages/core/test then packages/mcp/test, node --test, ~25 s, no network, no cost
 npm run cli -- doctor | agents | projects | run | runs | run-info | schedules
+npm run cli -- schedules run-now <id or name>   # stamps run_requested_at; the lease holder fires it next tick.
+                     # The command for git hooks / scripts: `run --no-wait` leaves the run unread once the CLI exits
 npm run cli -- serve  # long-running scheduler process; the MCP server also ticks
 npm run cli -- install-service [--print] | uninstall-service   # register `serve` with launchd / systemd --user / Task Scheduler
 npm run cli -- run --project <project id or abs path> --agent <agent id> --model haiku -- "task"
@@ -69,6 +71,9 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
   (`serve` / `mcp` / `cli`, `parseHolder`). Busy = `skipped_busy`, never a queue;
   no catch-up of missed ticks; `scheduler.enabled` is the kill switch read every tick.
   Create/update validation is `scheduler/crud.ts`, shared by MCP, CLI and dashboard.
+  Auto-pause (`autoPauseReason`, migration 16): before a scheduled fire, the last
+  `scheduler.auto_pause_after` ended runs all empty (0 tool calls) or needs review = pause with
+  `paused_reason`, outcome `auto_paused`; resume clears it, `auto_paused_at` bounds the next streak.
   `install-service` (`packages/mcp/src/service.ts`) renders a per-user unit (launchd,
   systemd --user, Task Scheduler XML) from machine paths: never version a unit, re-run it
   after every build (it restarts the service). Not the OS crontab.
@@ -88,10 +93,12 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
   (cents) and say so. An agent without an explicit model uses the CLI default,
   which can be 100x more expensive.
 - Dashboard: no component library, design tokens live in `apps/web/app/globals.css`
-  (dark and light). A completed run that hit a permission denial is "needs review"
+  (dark only, brand palette: night ground, sunset accent; fonts via `next/font` in
+  `app/layout.tsx`). A completed run that hit a permission denial is "needs review"
   (amber), never plain green. One rule decides needs-review (`reviewReasons` in
   `core/src/observability/run.ts`: budget exhausted, timed out, orphaned, non-zero exit,
-  failed, denial, context, MCP mismatch; never for cancelled or running). `RunManager.transition`
+  failed, denial, context, MCP mismatch, empty run = completed with 0 tool calls; never for
+  cancelled or running). `RunManager.transition`
   is its only caller: it stores the result in `review_reasons_json` (migration 9) and every
   reader (`summarizeRun`, badges, `NEEDS_REVIEW_SQL`, `attachLastRun` for schedule rows) uses
   the stored `run.reviewReasons`, never the rule. Orphans are detected with `isOrphaned`, not by
@@ -118,7 +125,8 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
 - **Agents can be bound to a project** (`project: <id>`): grouped, default target, refused
   elsewhere. `create_agent`/`update_agent` validate the spec *before* writing, and roll the
   file back if the config no longer loads: one bad agent file would otherwise break every
-  later config reload.
+  later config reload. They also refuse home paths and secret-looking values in any field
+  (`assertAgentSpecClean`, `core/src/config/agent-lint.ts`); `add_dirs` under home become `~/...`.
 - **Two agent kinds, always explicit**: `own` (persona written here, body = system prompt,
   no `claude_agent`) or `link` (`claude_agent` + a project folder given as `project_path` or a
   registered `project` id; runs as `claude --agent <name>` in that folder using its
@@ -133,8 +141,14 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
   one per agent by default (`max_concurrent_per_project`, `max_concurrent_per_agent`).
   Per agent, `max_concurrent: n` overrides the agent limit and `isolated: true` (a promise
   never to edit the checkout, not checked) skips the project guard; `max_concurrent_runs`
-  stays the hard cap. Refuse, never queue; keep "agent busy" / "project busy" in the error
-  text, the scheduler matches it for `skipped_busy`; a scheduler must treat "busy" as "skip this tick".
+  stays the hard cap. Refuse, never queue: the guards throw `BusyError` (`orchestration/busy.ts`,
+  message still says "agent busy" / "project busy" for humans) and the scheduler records
+  `skipped_busy` on `instanceof BusyError`, never by matching text; busy means "skip this tick".
+  Daily caps (`max_daily_runs`, `max_daily_cost_usd`, UTC day, counted from `runs`) are checked
+  there too but throw `DailyCapError` (`orchestration/daily-cap.ts`, not a BusyError): `skipped_daily_cap`.
+  Monthly budgets (`budgets` table, migration 18; scope global / agent / project, UTC month) come
+  last: a spent `hard_stop` one throws `BudgetError` (`orchestration/budget.ts`), pauses the
+  scope's schedules and the tick is `skipped_budget`; nothing resumes them automatically.
 - **Subagents are rows, not prose** (`run_agents`, migration 5): the parser folds Claude Code's
   `task_started` / `task_notification` lines and the `agent_id` of nested messages into one
   `SubagentRecord` per Agent call; `RunManager` writes them on `subagent_start` / `subagent_end`
@@ -147,6 +161,10 @@ npm workspaces, one `config/` and one SQLite database shared by three deliverabl
   `inherit_mcp: true`; then they get the user's claude.ai connectors with tool prefixes
   `mcp__claude_ai_Atlassian_Rovo__*`, `mcp__claude_ai_Figma__*` (not the `mcp__plugin_*`
   names interactive sessions may show). Allow-list by server: `mcp__claude_ai_Figma`.
+  Connectors load at start or not at all (seen missing in 3 runs out of 12 on 2026-10-20): the
+  executor compares the `init` line with the allow-listed prefixes (`requiredMcpServers`,
+  `execution/mcp.ts`) and restarts the child once, with a new session id, before the first
+  model turn (`mcp_restart` event, `#restart` log marker). Never more than once.
 
 - **Unattended runs get no permission prompts.** `permission_mode: acceptEdits` does
   not allow Bash; an agent that must run tests needs `allowed_tools` such as

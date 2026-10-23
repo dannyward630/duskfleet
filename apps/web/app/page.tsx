@@ -1,8 +1,8 @@
 import Link from "next/link";
 import { AutoRefresh } from "@/components/AutoRefresh";
 import { RunTable } from "@/components/RunTable";
-import { listAgents, listProjects, listRuns, listSchedules, modelStats, overview } from "@/lib/data";
-import { fmtCost, fmtDuration, fmtInt, fmtPct, shortModel } from "@/lib/format";
+import { budgetAlerts, listAgents, listProjects, listRuns, listSchedules, modelStats, overview } from "@/lib/data";
+import { fmtCost, fmtDayClock, fmtDuration, fmtInt, fmtPct, shortModel } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
@@ -48,6 +48,7 @@ export default async function RunsPage({ searchParams }: { searchParams: Promise
   const recent = listRuns({ ...filter, limit }).filter((r) => r.status !== "running");
   const o = overview(filter);
   const models = modelStats();
+  const budgets = budgetAlerts();
   const agentName = agent ? (agents.find((a) => a.id === agent)?.name ?? agent) : null;
   const scheduleName = schedule ? (listSchedules().find((s) => s.id === schedule)?.name ?? schedule) : null;
   const activeLabel = [project, agentName, scheduleName ? `schedule "${scheduleName}"` : null, q ? `"${q}"` : null]
@@ -63,28 +64,44 @@ export default async function RunsPage({ searchParams }: { searchParams: Promise
       <div className="page-head">
         <h1>
           Runs
+          {filtered && <span className="count"> · {activeLabel}</span>}
+        </h1>
+        <span className="head-side">
           {filtered && (
-            <span className="muted" style={{ fontWeight: 500 }}>
-              {" "}
-              · {activeLabel}
+            <span className="active-filter">
+              showing {fmtInt(recent.length + running.length)} of {fmtInt(total)}
+              <Link href="/" className="clear">
+                × clear filters
+              </Link>
             </span>
           )}
-        </h1>
-        {filtered && (
-          <span className="active-filter">
-            <span className="muted">
-              showing {fmtInt(recent.length + running.length)} of {fmtInt(total)}
-            </span>
-            <Link href="/" className="clear">
-              × clear filters
-            </Link>
-          </span>
-        )}
+          <span className="note">{fmtDayClock(new Date())}</span>
+        </span>
       </div>
+
+      {budgets.map((b) => {
+        const spent = b.state === "over";
+        const label = b.scope === "global" ? "Global budget" : `Budget of ${b.scope} ${b.scopeId}`;
+        return (
+          <div key={b.id} className={`callout ${spent && b.hardStop ? "bad" : "warn"}`} style={{ margin: "0 0 16px" }}>
+            <span className="icon">!</span>
+            <div>
+              <strong>
+                {label}: {fmtCost(b.spentUsd)} of {fmtCost(b.amountUsd)} this month ({b.percent}%).
+              </strong>{" "}
+              {spent
+                ? b.hardStop
+                  ? "Spent: new runs in this scope are refused and its schedules were paused until the month turns (UTC) or the budget is raised."
+                  : "Spent; hard_stop is off, so runs still start."
+                : `Past its ${b.warnPercent}% warning threshold.`}
+            </div>
+          </div>
+        );
+      })}
 
       <div className="toolbar">
         <div className="filters">
-          <span>Project</span>
+          <span className="filter-label">Project</span>
           <Link href={qs({ project: undefined })} className={`chip ${project ? "" : "on"}`}>
             all
           </Link>
@@ -99,45 +116,47 @@ export default async function RunsPage({ searchParams }: { searchParams: Promise
             </Link>
           ))}
         </div>
-        <div className="filters">
-          <span>Agent</span>
-          <Link href={qs({ agent: undefined })} className={`chip ${agent ? "" : "on"}`}>
-            all
-          </Link>
-          {agents
-            .filter((a) => !project || !a.project || a.project === project)
-            .map((a) => (
-              <Link
-                key={a.id}
-                href={qs({ agent: a.id })}
-                className={`chip ${agent === a.id ? "on" : ""}`}
-                title={a.name}
-              >
-                {a.id}
-              </Link>
-            ))}
-        </div>
-        {/* biome-ignore lint/a11y/useSemanticElements: the <search> element is not styled here; role="search" on the form is the established pattern */}
-        <form className="search" action="/" method="get" role="search">
-          {agent && <input type="hidden" name="agent" value={agent} />}
-          {project && <input type="hidden" name="project" value={project} />}
-          {schedule && <input type="hidden" name="schedule" value={schedule} />}
-          <input
-            type="search"
-            name="q"
-            defaultValue={q ?? ""}
-            placeholder="Search prompts or paste a run id…"
-            aria-label="Search runs"
-          />
-          <button type="submit" className="copy-btn">
-            Search
-          </button>
-          {q && (
-            <Link href={qs({ q: undefined })} className="clear">
-              × clear search
+        <div className="toolbar-row">
+          <div className="filters">
+            <span className="filter-label">Agent</span>
+            <Link href={qs({ agent: undefined })} className={`chip ${agent ? "" : "on"}`}>
+              all
             </Link>
-          )}
-        </form>
+            {agents
+              .filter((a) => !project || !a.project || a.project === project)
+              .map((a) => (
+                <Link
+                  key={a.id}
+                  href={qs({ agent: a.id })}
+                  className={`chip ${agent === a.id ? "on" : ""}`}
+                  title={a.name}
+                >
+                  {a.id}
+                </Link>
+              ))}
+          </div>
+          {/* biome-ignore lint/a11y/useSemanticElements: the <search> element is not styled here; role="search" on the form is the established pattern */}
+          <form className="search" action="/" method="get" role="search">
+            {agent && <input type="hidden" name="agent" value={agent} />}
+            {project && <input type="hidden" name="project" value={project} />}
+            {schedule && <input type="hidden" name="schedule" value={schedule} />}
+            <input
+              type="search"
+              name="q"
+              defaultValue={q ?? ""}
+              placeholder="Search prompts or paste a run id…"
+              aria-label="Search runs"
+            />
+            <button type="submit" className="search-btn">
+              Search
+            </button>
+            {q && (
+              <Link href={qs({ q: undefined })} className="clear">
+                × clear search
+              </Link>
+            )}
+          </form>
+        </div>
       </div>
 
       <section
@@ -172,6 +191,14 @@ export default async function RunsPage({ searchParams }: { searchParams: Promise
           <div className="value">{fmtCost(o.costUsd)}</div>
           <div className="sub">
             {fmtCost(o.costLast24hUsd)} in the last 24 h{filtered ? " · in this filter" : ""}
+            {o.costGatesUsd > 0 && (
+              <>
+                <br />
+                <span title="Schedule gate agents decide whether a tick has work; their runs are not in the counts, only here">
+                  {fmtCost(o.costUsd - o.costGatesUsd)} on runs · {fmtCost(o.costGatesUsd)} on gates
+                </span>
+              </>
+            )}
           </div>
         </div>
       </section>
@@ -194,6 +221,7 @@ export default async function RunsPage({ searchParams }: { searchParams: Promise
         {filtered && <span className="count">· filtered by {activeLabel}</span>}
       </h2>
       <RunTable
+        ended
         runs={recent}
         emptyText={
           filtered
@@ -222,7 +250,7 @@ export default async function RunsPage({ searchParams }: { searchParams: Promise
           <h2>
             By model <span className="count">all runs</span>
           </h2>
-          <div className="card" style={{ padding: "4px 6px" }}>
+          <div className="card model-card">
             <table className="table">
               <thead>
                 <tr>

@@ -24,7 +24,20 @@ entry that does the job, link it; write a persona only when nothing exists.
 | `data/agents/<id>.md` (`user_agents_dir`) | `create_agent` over MCP, or by hand | **user** agents, git-ignored. Same id as a builtin = override |
 
 Both are re-read on every run and every `list_agents` call, so edits apply without restarting
-anything. Code never writes into `config/agents`.
+anything. Code never writes into `config/agents`. Because a user agent may later be committed,
+`create_agent` / `update_agent` refuse home directory paths and secret-looking values in any
+field, and store `add_dirs` inside your home directory as `~/...`
+([MCP server](mcp-server.md)).
+
+## Builtin agents
+
+General-purpose patterns shipped in `config/agents/`, not bound to any project. Point them at a
+project with `run_agent` or a schedule; to change their envelope (model, allow-list, budget),
+copy the file into `data/agents/` with the same id and edit the copy.
+
+| Id | What it does |
+|---|---|
+| `pr-check-loop` | Gets the checks of one pull request green. It takes the PR named in the task, or the oldest open PR whose head commit has a failing check (none: `nothing to do`). Each iteration reads the latest head SHA, waits for its checks (`gh pr checks --watch --interval 30`), classifies every failing job and applies a fixed action: **regression** = fix the code and push, **lint** = run the lint command locally and push, **flake** = one `gh run rerun --failed` per job, **external / secret** = stop with a blocker report. At most 5 iterations; it never force-pushes or touches workflow files, and stops on a dirty checkout. It leaves a PR comment unless the checks went green without any change from it. Sonnet, `acceptEdits`, $3, 60 min; the allow-list covers `gh pr` / `gh run`, `git` and `npm` (copy it into `data/agents/` for another toolchain). Meant to be scheduled every 30 minutes: `create_schedule` with cron `*/30 * * * *` on the project |
 
 ## Frontmatter
 
@@ -43,6 +56,8 @@ permission_mode: acceptEdits      # acceptEdits | dontAsk | auto | manual  (plan
 # effort: high
 # max_concurrent: 3               # runs of this agent at once (whole number >= 1); default max_concurrent_per_agent (1)
 # isolated: true                  # never edits the project checkout: ignores max_concurrent_per_project
+# max_daily_runs: 24              # runs of this agent per UTC day (whole number >= 1); default no cap
+# max_daily_cost_usd: 10          # spend of this agent per UTC day; default no cap
 timeout_minutes: 30
 max_budget_usd: 5
 # wrap_up_reserve_usd: 0.5     # part of max_budget_usd kept for the wrap-up pass; default 10%, min $0.50, 0 = off
@@ -112,6 +127,62 @@ Two frontmatter fields lift the limits per agent:
 for `max_concurrent` is a config error naming the file. `list_agents` reports both fields
 (`maxConcurrent` is the effective limit) and the dashboard shows them in the limits row when
 they differ from the defaults.
+
+## Daily caps
+
+`max_concurrent` bounds how many runs are active at once; nothing in it bounds a day. An
+hourly schedule, or a loop of `run_agent` calls, can start runs all day long. Two frontmatter
+fields cap an agent per **UTC day** (from 00:00 UTC, whatever the schedule's time zone):
+
+- `max_daily_runs: <n>`: every run of the agent created since 00:00 UTC counts, whatever its
+  outcome (failed, cancelled, a gate run of this agent, a resume). The `n + 1`-th is refused.
+- `max_daily_cost_usd: <x>`: once the recorded cost of the agent's runs since 00:00 UTC is at
+  or above `x`, the next run is refused. A run in progress is not stopped and adds its cost only
+  when it ends, so a day can end above `x` by at most one run's `max_budget_usd` per active run.
+
+A refusal throws before anything is spawned or recorded, with a message starting
+`daily cap: agent <id> ...`. It is not "busy": busy clears when a run ends, a cap only at the
+next UTC midnight. A schedule of the agent records the tick as `skipped_daily_cap` (checked
+after the busy check and before any gate, so a capped tick spends nothing; a capped gate agent
+gives `skipped_daily_cap` too). A non-integer or a value below 1 for `max_daily_runs`, or a
+non-positive `max_daily_cost_usd`, is a config error naming the file. `list_agents` reports
+`maxDailyRuns` / `maxDailyCostUsd` (`null` = no cap); `update_agent` removes one with
+`clear: ["max_daily_runs"]`.
+
+## Monthly budgets
+
+Daily caps bound one agent per day. A budget bounds a **scope** per **calendar month (UTC)**:
+`global` (every run), `agent <id>` (the runs of one agent) or `project <id>` (the runs on one
+project, whichever agent: counted by project id, and by the project's path for runs started
+with a path). Budgets are rows in the database (`budgets` table), one per scope, managed with
+`set_budget` / `list_budgets` / `delete_budget` over MCP or `duskfleet budgets` on the CLI:
+
+```bash
+npm run cli -- budgets set global --amount 200
+npm run cli -- budgets set project my-app --amount 50 --warn 70
+npm run cli -- budgets set agent pr-reviewer --amount 20 --no-hard-stop
+npm run cli -- budgets
+```
+
+| Field | Meaning |
+|---|---|
+| `amount_usd` | spend allowed per UTC month, compared with the recorded `cost_usd` of the scope's runs created since the 1st at 00:00 UTC (gate runs included) |
+| `warn_percent` | default 80: from this share of `amount_usd` the budget is `warn` |
+| `hard_stop` | default true: once the spend reaches `amount_usd` (`over`), new runs in the scope are refused and its schedules paused. `false` = warn only, runs still start |
+
+Every budget covering a run (global, the agent's, the project's) is checked in `startRun`,
+after the busy guards and the daily caps, before anything is spawned. A spent hard-stop budget
+throws a `BudgetError` (message `budget: the <scope> budget is spent ...`) and pauses every
+enabled schedule of the scope (global: all of them; agent: that agent's; project: the schedules
+that run on it, by their own `project_id` or their agent's binding). A schedule tick refused
+this way is `skipped_budget`. Paused schedules stay paused when the month turns or the budget
+is raised or deleted: resume them by hand. A run in progress is not stopped, so a month can end
+above the amount by at most one run's `max_budget_usd` per active run.
+
+The dashboard's **Runs** page shows a banner for each budget at `warn` (amber) or `over`
+(coral when it stops runs); `list_budgets` and `duskfleet budgets` report `spentUsd`,
+`percent`, `state` (`ok` \| `warn` \| `over`) and `periodStart` for every budget.
+
 ## Resume once on failure
 
 The wrap-up pass leaves a trace; it does not finish the job. `on_failure: resume_once` lets a
@@ -213,6 +284,16 @@ connector (what runs see). Every run records what was mounted and which servers 
 actually called (`get_run` → `mcp`, dashboard → Technical details). An allow-list entry
 whose server never mounted is reported as `mcp.allowListedMissing`, flags the run as
 **needs review** and adds a note event, instead of failing silently.
+
+**Connectors load at start or not at all.** Now and then Claude Code comes up with no
+claude.ai connector (3 runs out of 12 on 2026-10-20: the init line listed only the project's
+`.mcp.json` server). With `inherit_mcp`, DuskFleet compares the init line against the agent's
+allow-listed servers and, when one is absent, ends the process and starts it again with a fresh
+session, once; the init line comes before the first model turn, so the restart costs seconds,
+not dollars. The run gets a note (`init reported no server for mcp__claude_ai_Figma ...
+restarted once`) and the log a `#restart` marker. If the second process lacks it too, the run
+goes on and is flagged `mcp_missing` as above. Entries that never mount because the name is
+wrong (`mcp__plugin_*`) trigger the same one restart on every run: fix the name.
 
 ## Subagents inside runs
 

@@ -1,4 +1,12 @@
-import { REVIEW_REASON_LABELS, type RunEvent, wrapUpPhase } from "@duskfleet/core";
+import {
+  type DiffFileStatus,
+  FAILURE_LABELS,
+  REVIEW_REASON_LABELS,
+  type Run,
+  type RunDiff,
+  type RunEvent,
+  wrapUpPhase,
+} from "@duskfleet/core";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { AutoRefresh } from "@/components/AutoRefresh";
@@ -8,6 +16,7 @@ import { Prose } from "@/components/Prose";
 import { StatusBadge } from "@/components/StatusBadge";
 import { adjacentRuns, agentSummary, getRun, homeDir, projectLabel } from "@/lib/data";
 import {
+  billingNote,
   elapsedSince,
   fmtCompact,
   fmtCost,
@@ -30,21 +39,36 @@ export async function generateMetadata({ params }: { params: Promise<{ id: strin
   return { title: data ? `${runTitle(data.run.prompt, 60)} · DuskFleet` : "Run not found · DuskFleet" };
 }
 
-export default async function RunPage({ params }: { params: Promise<{ id: string }> }) {
+/** Timeline entries shown before "show all N events" (denials, errors and the result are always shown). */
+const TIMELINE_LIMIT = 60;
+
+export default async function RunPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ events?: string }>;
+}) {
   const { id } = await params;
+  const showAll = (await searchParams).events === "all";
   const data = getRun(id);
   if (!data) notFound();
-  const { run, events, resumedFrom, resumedBy } = data;
+  const { run, events, diff, resumedFrom, resumedBy } = data;
   const home = homeDir();
   const live = run.status === "running" || run.status === "pending";
   const duration = live ? elapsedSince(run.startedAt) : run.durationMs;
   const denials = run.permissionDenials ?? 0;
   const mcpMissing = run.mcp?.allowListedMissing ?? [];
+  // Every missing entry is a claude.ai connector and none mounted: the connectors did not load, not a wrong name.
+  const connectorsNeverLoaded =
+    mcpMissing.length > 0 &&
+    mcpMissing.every((p) => p.startsWith("mcp__claude_ai_")) &&
+    !(run.mcp?.mounted ?? []).some((m) => m.name.startsWith("claude.ai "));
   const wrapUp = wrapUpPhase(run);
   const mainPhase = run.phases.find((p) => p.phase === "main") ?? null;
   const reasons = run.reviewReasons; // stored by RunManager when the run ended
   const needsAttention = reasons.length > 0;
-  const hasIssues = needsAttention || Boolean(run.error) || wrapUp !== null;
+  const hasIssues = needsAttention || Boolean(run.error) || run.errorCode !== null || wrapUp !== null;
   const resume = run.claudeSessionId
     ? `cd ${shellQuote(run.projectPath)} && claude --resume ${run.claudeSessionId}`
     : null;
@@ -67,6 +91,10 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
   const started = run.startedAt ?? run.createdAt;
   const tokensIn = run.inputTokens ?? null;
   const tokensOut = run.outputTokens ?? null;
+  // One row per event plus the closing result row; the header and "show all" count these.
+  const rows = markDenied(events.map(toRow(run, t0, home)), run.deniedTools ?? []);
+  const result = resultRow(run, t0);
+  if (result) rows.push(result);
 
   return (
     <>
@@ -88,7 +116,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
                 ← older
               </Link>
             ) : (
-              <span className="faint">← older</span>
+              <span className="chip-link off">← older</span>
             )}
             {next ? (
               <Link
@@ -99,7 +127,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
                 newer →
               </Link>
             ) : (
-              <span className="faint">newer →</span>
+              <span className="chip-link off">newer →</span>
             )}
           </span>
         </div>
@@ -136,7 +164,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
           {hasIssues && (
             <>
               <span className="sep">·</span>
-              <a href="#issues" className="muted">
+              <a href="#issues" className="to-issues">
                 see issues ↓
               </a>
             </>
@@ -147,7 +175,11 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
 
       <div className="facts">
         <Fact label="Duration" value={fmtDuration(duration)} />
-        <Fact label="Cost" value={fmtCost(run.costUsd)} />
+        <Fact
+          label={run.billingType === "subscription" ? "Cost · reported, not billed" : "Cost"}
+          value={fmtCost(run.costUsd)}
+          title={billingNote(run.billingType) ?? undefined}
+        />
         <Fact label="Turns" value={fmtInt(run.numTurns)} />
         <Fact label="Tool calls" value={fmtInt(run.toolCalls)} />
         <Fact
@@ -162,7 +194,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
         <Fact
           label="Denials"
           value={live && run.permissionDenials === null ? "–" : String(denials)}
-          tone={denials > 0 ? "warn" : "neutral"}
+          tone={denials > 0 ? "warn" : undefined}
         />
       </div>
 
@@ -226,11 +258,10 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
               the tool if it should have been permitted. The denied calls are{" "}
               <span className="flag warn">highlighted</span> in the timeline below.
               {(run.deniedTools ?? []).length > 0 && (
-                <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                <ul className="denied-calls">
                   {(run.deniedTools ?? []).map((d, i) => (
                     <li key={i}>
-                      <code>{d.tool}</code>
-                      {d.summary && <span className="muted"> {tildeText(d.summary, home)}</span>}
+                      <code>{d.summary ? `${d.tool}(${tildeText(d.summary, home)})` : d.tool}</code>
                     </li>
                   ))}
                 </ul>
@@ -251,8 +282,19 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
               ))}
               . Mounted in this run:{" "}
               {run.mcp.mounted.length ? run.mcp.mounted.map((m) => m.name).join(", ") : "none reported"}
-              {run.mcp.used.length ? <>; used: {run.mcp.used.join(", ")}</> : null}. The names differ (e.g.{" "}
-              <code>mcp__plugin_*</code> vs <code>mcp__claude_ai_*</code>); fix the agent's <code>allowed_tools</code>.
+              {run.mcp.used.length ? <>; used: {run.mcp.used.join(", ")}</> : null}.{" "}
+              {connectorsNeverLoaded ? (
+                <>
+                  No claude.ai connector mounted at all: Claude Code came up without them (it happens; DuskFleet
+                  restarts the process once when the init line shows it, and this run still had none). The allow-list is
+                  fine; run it again.
+                </>
+              ) : (
+                <>
+                  The names differ (e.g. <code>mcp__plugin_*</code> vs <code>mcp__claude_ai_*</code>); fix the agent's{" "}
+                  <code>allowed_tools</code>.
+                </>
+              )}
             </div>
           </div>
         )}
@@ -265,11 +307,41 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
             </div>
           </div>
         )}
+        {run.errorCode === "auth_required" && (
+          <div className="callout bad">
+            <span className="icon">!</span>
+            <div>
+              <strong>Claude is not logged in.</strong> Every run on this machine fails until it is: run{" "}
+              <code>claude /login</code> in a terminal
+              {run.errorDetail?.loginUrl ? (
+                <>
+                  {" "}
+                  or open{" "}
+                  <a href={run.errorDetail.loginUrl} target="_blank" rel="noreferrer">
+                    the login page
+                  </a>
+                </>
+              ) : null}
+              , then run it again.
+            </div>
+          </div>
+        )}
+        {run.errorCode === "refusal" && !run.error && (
+          <div className="callout warn">
+            <span className="icon">!</span>
+            <div>
+              <strong>{FAILURE_LABELS.refusal}.</strong> The run ended with <code>stop_reason: refusal</code>: check the
+              result before relying on it.
+            </div>
+          </div>
+        )}
         {run.error && (
           <div className="callout bad">
             <span className="icon">×</span>
             <div>
-              <strong>Error.</strong> {tildeText(run.error, home)}
+              <strong>Error{run.errorCode ? `: ${FAILURE_LABELS[run.errorCode]}` : ""}.</strong>{" "}
+              {run.errorDetail?.retryNotBefore ? <>Resets {fmtTime(run.errorDetail.retryNotBefore)}. </> : null}
+              {tildeText(run.error, home)}
             </div>
           </div>
         )}
@@ -312,13 +384,15 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
             </div>
           )}
 
-          <h2>
-            Timeline <span className="count">{events.length} events</span>
+          {diff && <Changes run={run} diff={diff} />}
+
+          <h2 id="timeline">
+            Timeline <span className="count">{fmtInt(rows.length)} events</span>
           </h2>
-          <Timeline events={events} t0={t0} cwd={run.projectPath} home={home} denied={run.deniedTools ?? []} />
+          <Timeline run={run} rows={rows} limit={showAll ? null : TIMELINE_LIMIT} />
         </div>
 
-        <div style={{ display: "grid", gap: 20 }}>
+        <div className="run-side">
           {resume && (
             <div>
               <h2 style={{ marginTop: 0 }}>Resume this session</h2>
@@ -345,12 +419,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
             <h2 style={{ marginTop: 0 }}>
               Prompt <span className="count">{fmtInt(run.prompt.length)} chars</span>
             </h2>
-            <div className="cmd">
-              <blockquote className="quote" style={{ flex: 1 }}>
-                {run.prompt}
-              </blockquote>
-              <CopyButton text={run.prompt} />
-            </div>
+            <blockquote className="quote">{run.prompt}</blockquote>
           </div>
 
           <details className="tech" open={needsAttention}>
@@ -369,26 +438,12 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
                 <dd className="mono">{run.permissionMode}</dd>
                 <dt>model used</dt>
                 <dd className="mono">{run.modelUsed ?? "–"}</dd>
-                <dt>model requested</dt>
-                <dd className="mono">{run.modelRequested ?? "agent / CLI default"}</dd>
-                <dt>created</dt>
-                <dd>{fmtTime(run.createdAt)}</dd>
-                <dt>started</dt>
-                <dd>{fmtTime(run.startedAt)}</dd>
-                <dt>ended</dt>
-                <dd>{fmtTime(run.endedAt)}</dd>
-                <dt>exit code</dt>
-                <dd>{run.exitCode ?? "–"}</dd>
                 <dt>termination</dt>
                 <dd className="mono">{run.terminationReason ?? "–"}</dd>
-                <dt>input tokens</dt>
-                <dd>{fmtInt(run.inputTokens)}</dd>
-                <dt>output tokens</dt>
-                <dd>{fmtInt(run.outputTokens)}</dd>
-                <dt>cache read</dt>
-                <dd>{fmtInt(run.cacheReadTokens)}</dd>
-                <dt>cache write</dt>
-                <dd>{fmtInt(run.cacheCreationTokens)}</dd>
+                <dt>cache read / write</dt>
+                <dd className="num">
+                  {fmtInt(run.cacheReadTokens)} / {fmtInt(run.cacheCreationTokens)}
+                </dd>
                 <dt>mcp mounted</dt>
                 <dd className="mono">
                   {run.mcp?.mounted?.length
@@ -397,13 +452,21 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
                 </dd>
                 <dt>mcp used</dt>
                 <dd className="mono">{run.mcp?.used?.length ? run.mcp.used.join(", ") : "–"}</dd>
+                <dt>model requested</dt>
+                <dd className="mono">{run.modelRequested ?? "agent / CLI default"}</dd>
+                <dt>exit code</dt>
+                <dd className="mono">{run.exitCode ?? "–"}</dd>
+                <dt>started</dt>
+                <dd>{fmtTime(started)}</dd>
+                <dt>ended</dt>
+                <dd>{fmtTime(run.endedAt)}</dd>
                 <dt>log</dt>
                 <dd className="mono" title={run.logPath ?? undefined}>
                   {tildePath(run.logPath, home)}
                 </dd>
               </dl>
               <div>
-                <div className="muted" style={{ fontSize: "0.8rem", marginBottom: 6 }}>
+                <div className="muted" style={{ fontSize: 13, marginBottom: 6 }}>
                   Exact command
                 </div>
                 <div className="cmd">
@@ -419,17 +482,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
   );
 }
 
-function Fact({
-  label,
-  value,
-  title,
-  tone,
-}: {
-  label: string;
-  value: string;
-  title?: string;
-  tone?: "ok" | "warn" | "bad" | "neutral";
-}) {
+function Fact({ label, value, title, tone }: { label: string; value: string; title?: string; tone?: Tone }) {
   return (
     <div className="fact">
       <div className="label">{label}</div>
@@ -440,75 +493,142 @@ function Fact({
   );
 }
 
+type Tone = "ok" | "warn" | "bad";
+
+// ---- changes ------------------------------------------------------------------
+
+const DIFF_STATUS_MARK: Record<DiffFileStatus, string> = {
+  added: "A",
+  modified: "M",
+  deleted: "D",
+  renamed: "R",
+  copied: "C",
+  type_changed: "T",
+  untracked: "?",
+};
+
+/** What the run changed in its git checkout: one line per file, totals, a link to the patch. */
+function Changes({ run, diff }: { run: Run; diff: RunDiff }) {
+  const n = diff.filesChanged;
+  return (
+    <>
+      <h2 id="changes">
+        Changes{" "}
+        <span className="count">
+          {n === 0
+            ? "no files changed"
+            : `${fmtInt(n)} file${n === 1 ? "" : "s"} · +${fmtInt(diff.additions)}${diff.totalsPartial ? "+" : ""} −${fmtInt(diff.deletions)}`}
+        </span>
+      </h2>
+      {n > 0 && (
+        <ul className="changes">
+          {diff.changedFiles.map((f) => (
+            <li key={`${f.status}:${f.path}`}>
+              <span className="st" title={f.status.replace("_", " ")}>
+                {DIFF_STATUS_MARK[f.status] ?? "M"}
+              </span>
+              <span className="file">{f.oldPath ? `${f.oldPath} → ${f.path}` : f.path}</span>
+              <span className="lines">
+                {f.uncounted ? (
+                  <span className="muted" title="past the line-counting caps">
+                    not counted
+                  </span>
+                ) : f.additions === null ? (
+                  <span className="muted">binary</span>
+                ) : (
+                  <>
+                    <span className="add">+{fmtInt(f.additions)}</span>{" "}
+                    <span className="del">−{fmtInt(f.deletions ?? 0)}</span>
+                  </>
+                )}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="timeline-foot">
+        <span className="muted" title={diff.base}>
+          since {diff.base.slice(0, 8)}
+          {diff.head && diff.head !== diff.base ? ` (now ${diff.head.slice(0, 8)}, the run committed)` : ""}
+        </span>
+        {diff.filesTruncated && (
+          <>
+            <span className="sep">·</span>
+            <span className="muted">first {fmtInt(diff.changedFiles.length)} files listed</span>
+          </>
+        )}
+        {diff.totalsPartial && (
+          <>
+            <span className="sep">·</span>
+            <span className="muted">totals leave out the untracked entries marked "not counted"</span>
+          </>
+        )}
+        {diff.patchPath && (
+          <>
+            <span className="sep">·</span>
+            <a href={`/runs/${run.id}/diff`} target="_blank" rel="noreferrer">
+              open the patch{diff.patchTruncated ? " (incomplete)" : ""}
+            </a>
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
 // ---- timeline ---------------------------------------------------------------
+
+/** Type colours: tool calls sky, result green (amber when it needs review), errors coral, the rest muted. */
+type Kind = "tool" | "muted" | Tone;
 
 interface Row {
   key: string;
   offsetMs: number;
-  icon: string;
-  iconCls: string;
+  /** Type column: "system", "Read", "Bash", "Figma", "result"… */
   name: string;
+  kind: Kind;
   detail: string;
   mono: boolean;
-  isStatus: boolean;
   denied: boolean;
   toolName: string | null;
 }
 
 type Entry = { kind: "row"; row: Row } | { kind: "group"; rows: Row[] };
+type Shown = Entry | { kind: "gap"; hidden: number };
 
-const LEGEND: Array<{ cls: string; icon: string; label: string }> = [
-  { cls: "read", icon: "read", label: "Read / Grep / Glob" },
-  { cls: "edit", icon: "edit", label: "Edit / Write" },
-  { cls: "sh", icon: "sh", label: "Bash" },
-  { cls: "mcp", icon: "mcp", label: "MCP tool" },
-  { cls: "status", icon: "◆", label: "status change" },
-  { cls: "denied", icon: "✗", label: "denied call" },
-];
-
-function Timeline({
-  events,
-  t0,
-  cwd,
-  home,
-  denied,
-}: {
-  events: RunEvent[];
-  t0: number;
-  cwd: string;
-  home: string;
-  denied: Array<{ tool: string; summary: string | null }>;
-}) {
-  const rows = markDenied(events.map(toRow(t0, cwd, home)), denied);
+function Timeline({ run, rows, limit }: { run: Run; rows: Row[]; limit: number | null }) {
   if (rows.length === 0) return <div className="empty">No events recorded.</div>;
   const entries = groupRuns(rows);
-  const used = new Set(rows.map((r) => (r.denied ? "denied" : r.iconCls)));
+  const shown = capEntries(entries, limit);
+  const truncated = shown.some((e) => e.kind === "gap");
+  const showAll = `/runs/${run.id}?events=all#timeline`;
   return (
     <>
-      <section className="legend" aria-label="Legend">
-        {LEGEND.filter((l) => used.has(l.cls)).map((l) => (
-          <span key={l.cls}>
-            <span className={`ic ${l.cls}`}>{l.icon}</span>
-            {l.label}
-          </span>
-        ))}
-        <span className="faint">· click a line to see it in full</span>
-      </section>
       <ul className="timeline">
-        {entries.map((e, i) =>
-          e.kind === "row" ? (
-            <TimelineRow key={e.row.key} r={e.row} />
-          ) : (
-            <li key={`g${i}`} className="group">
+        {shown.map((e, i) => {
+          if (e.kind === "row") return <TimelineRow key={e.row.key} r={e.row} />;
+          if (e.kind === "gap")
+            return (
+              <li key={`gap${i}`} className="skipped">
+                <Link href={showAll} className="muted">
+                  … {fmtInt(e.hidden)} more {e.hidden === 1 ? "entry" : "entries"}
+                </Link>
+              </li>
+            );
+          const first = e.rows[0] as Row;
+          const last = e.rows[e.rows.length - 1] as Row;
+          const span = fmtOffset(first.offsetMs) === fmtOffset(last.offsetMs) ? "" : ` → ${fmtOffset(last.offsetMs)}`;
+          return (
+            <li key={`g${first.key}`} className="group">
               <details>
                 <summary>
-                  <span className="off">{fmtOffset(e.rows[0]!.offsetMs)}</span>
-                  <span className={`ic ${e.rows[0]!.iconCls}`}>{e.rows[0]!.icon}</span>
-                  <span className="name">
-                    {e.rows[0]!.name} <span className="count-tag">×{e.rows.length}</span>
+                  <span className="off">{fmtOffset(first.offsetMs)}</span>
+                  <span className={`name ${first.kind}`}>
+                    {first.name} <span className="count-tag">×{e.rows.length}</span>
                   </span>
                   <span className="detail plain">
-                    {fmtOffset(e.rows[0]!.offsetMs)} → {fmtOffset(e.rows[e.rows.length - 1]!.offsetMs)} ·{" "}
+                    {fmtOffset(first.offsetMs)}
+                    {span} ·{" "}
                     {e.rows
                       .map((r) => r.detail)
                       .filter(Boolean)
@@ -524,9 +644,22 @@ function Timeline({
                 </ul>
               </details>
             </li>
-          ),
-        )}
+          );
+        })}
       </ul>
+      <div className="timeline-foot">
+        {truncated && (
+          <>
+            <Link href={showAll}>show all {fmtInt(rows.length)} events</Link>
+            {run.logPath && <span className="sep">·</span>}
+          </>
+        )}
+        {run.logPath && (
+          <a href={`/runs/${run.id}/log`} target="_blank" rel="noreferrer">
+            open the JSONL log
+          </a>
+        )}
+      </div>
     </>
   );
 }
@@ -535,24 +668,74 @@ function TimelineRow({ r }: { r: Row }) {
   return (
     <li
       id={`ev-${r.key}`}
-      className={`${r.isStatus ? "status-row" : ""} ${r.denied ? "denied" : ""}`}
+      className={r.denied ? "denied" : undefined}
       title={r.denied ? "This call was denied: the tool is not in the agent's allowed_tools" : undefined}
     >
-      <span className="off">{fmtOffset(r.offsetMs)}</span>
-      <span className={`ic ${r.denied ? "denied" : r.iconCls}`}>{r.denied ? "✗" : r.icon}</span>
-      <span className="name">
-        {r.name}
-        {r.denied && <span className="count-tag"> denied</span>}
+      <span className="off" title={`+${(Math.max(0, r.offsetMs) / 1000).toFixed(1)}s`}>
+        {fmtOffset(r.offsetMs)}
       </span>
-      <span
-        className={`detail ${r.mono ? "" : "plain"}`}
-        tabIndex={r.detail.length > 60 ? 0 : undefined}
-        title={r.detail}
-      >
-        {r.detail}
+      <span className={`name ${r.denied ? "denied" : r.kind}`} title={r.toolName ?? undefined}>
+        {r.name}
+      </span>
+      <span className="what">
+        <span
+          className={`detail ${r.mono ? "" : "plain"}`}
+          tabIndex={r.detail.length > 60 ? 0 : undefined}
+          title={r.detail}
+        >
+          {r.detail}
+        </span>
+        {r.denied && <span className="flag warn">denied</span>}
       </span>
     </li>
   );
+}
+
+/**
+ * The first `limit` entries, plus every entry that must stay visible (denied calls,
+ * errors, the result row) wherever it is; the hidden stretches become gap markers.
+ */
+function capEntries(entries: Entry[], limit: number | null): Shown[] {
+  if (limit === null || entries.length <= limit) return entries;
+  const pinned = (e: Entry) => e.kind === "row" && (e.row.denied || e.row.kind === "bad" || e.row.key === "result");
+  const out: Shown[] = [];
+  let hidden = 0;
+  entries.forEach((e, i) => {
+    if (i < limit || pinned(e)) {
+      if (hidden > 0) out.push({ kind: "gap", hidden });
+      hidden = 0;
+      out.push(e);
+    } else hidden++;
+  });
+  if (hidden > 0) out.push({ kind: "gap", hidden });
+  return out;
+}
+
+/** The run's outcome as a closing row, once it has ended. Same verdict as the status badge. */
+function resultRow(run: Run, t0: number): Row | null {
+  if (!run.endedAt) return null;
+  // the stored verdict, never the rule (see reviewReasons in core)
+  const review = run.status === "completed" && run.reviewReasons.length > 0;
+  const kind: Kind =
+    run.status === "completed" ? (review ? "warn" : "ok") : run.status === "cancelled" ? "muted" : "bad";
+  const detail = [
+    review ? "needs review" : null,
+    run.terminationReason ?? run.status,
+    run.exitCode !== null && run.exitCode !== undefined ? `exit ${run.exitCode}` : null,
+    run.costUsd !== null && run.costUsd !== undefined ? fmtCost(run.costUsd) : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return {
+    key: "result",
+    offsetMs: new Date(run.endedAt).getTime() - t0,
+    name: "result",
+    kind,
+    detail,
+    mono: false,
+    denied: false,
+    toolName: null,
+  };
 }
 
 /** Consecutive calls of the same tool (3 or more, none denied) collapse into one expandable row. */
@@ -601,15 +784,16 @@ function markDenied(rows: Row[], denied: Array<{ tool: string; summary: string |
   return out;
 }
 
-function toRow(t0: number, cwd: string, home: string) {
+function toRow(run: Run, t0: number, home: string) {
+  const cwd = run.projectPath;
   return (e: RunEvent): Row => {
     const p = (e.payload ?? {}) as Record<string, unknown>;
     const offsetMs = new Date(e.ts).getTime() - t0;
     const base = {
       key: String(e.id),
       offsetMs,
+      kind: "muted" as Kind,
       mono: true,
-      isStatus: false,
       denied: false,
       toolName: null as string | null,
     };
@@ -617,64 +801,62 @@ function toRow(t0: number, cwd: string, home: string) {
       case "status_change":
         return {
           ...base,
-          icon: "◆",
-          iconCls: "status",
-          name: String(p["to"] ?? "status"),
-          detail: p["from"] ? `from ${String(p["from"])}` : "run created",
-          mono: false,
-          isStatus: true,
-        };
-      case "init":
-        return {
-          ...base,
-          icon: "▶",
-          iconCls: "status",
-          name: "session",
-          detail: [
-            p["model"] ? shortModel(String(p["model"])) : null,
-            p["cliVersion"] ? `Claude Code ${String(p["cliVersion"])}` : null,
-            p["tools"] !== undefined ? `${String(p["tools"])} tools` : null,
-          ]
-            .filter(Boolean)
-            .join(" · "),
+          name: "status",
+          detail: p["from"]
+            ? `${String(p["from"])} → ${String(p["to"] ?? "?")}`
+            : `${String(p["to"] ?? "?")} · run created`,
           mono: false,
         };
+      case "init": {
+        const servers = Array.isArray(p["mcpServers"]) ? (p["mcpServers"] as unknown[]).map(String) : null;
+        const mounted = servers?.filter((s) => s.endsWith("(connected)")).length ?? 0;
+        const detail = [
+          "session started",
+          p["model"] ? shortModel(String(p["model"])) : null,
+          run.permissionMode,
+          servers && servers.length > 0 ? `${mounted} MCP server${mounted === 1 ? "" : "s"} mounted` : null,
+          p["cliVersion"] ? `Claude Code ${String(p["cliVersion"])}` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+        return { ...base, name: "system", detail, mono: false };
+      }
       case "tool_use": {
         const name = String(p["name"] ?? "tool");
         const raw = typeof p["summary"] === "string" ? p["summary"] : "";
         // Paths inside the project read better relative to it; others relative to home.
         const summary = tildeText(raw.split(cwd.endsWith("/") ? cwd : cwd + "/").join(""), home);
+        // MCP tools: the server is the type, the tool name leads the detail.
+        const m = /^mcp__(?:claude_ai_|plugin_)?(.+?)__(.+)$/.exec(name);
+        if (!m) return { ...base, kind: "tool", name, detail: summary, toolName: name };
+        const [, server = "", tool = ""] = m;
         return {
           ...base,
-          icon: toolIcon(name),
-          iconCls: toolClass(name),
-          name: shortToolName(name),
-          detail: summary,
+          kind: "tool",
+          name: server.replace(/_/g, " "),
+          detail: summary ? `${tool} ${summary}` : tool,
           toolName: name,
         };
       }
       case "error":
         return {
           ...base,
-          icon: "×",
-          iconCls: "err",
+          kind: "bad",
           name: "error",
           detail: tildeText(String(p["parseError"] ?? p["message"] ?? JSON.stringify(p)), home),
         };
       case "note":
         return {
           ...base,
-          icon: "·",
-          iconCls: "",
           name: "note",
           detail: tildeText(String(p["message"] ?? JSON.stringify(p)), home),
           mono: false,
         };
       case "phase": {
         const started = p["status"] === "started";
-        const name = `${String(p["phase"] ?? "phase").replace("_", "-")} ${started ? "started" : "ended"}`;
         const detail = started
           ? [
+              "started",
               p["budgetUsd"] !== undefined ? `budget ${fmtCost(Number(p["budgetUsd"]))}` : null,
               p["mainCostUsd"] !== undefined ? `main pass spent ${fmtCost(Number(p["mainCostUsd"]))}` : null,
               p["reason"] ? String(p["reason"]) : null,
@@ -682,41 +864,27 @@ function toRow(t0: number, cwd: string, home: string) {
               .filter(Boolean)
               .join(" · ")
           : [
+              "ended",
               p["outcome"] ? String(p["outcome"]) : null,
               p["costUsd"] !== undefined ? fmtCost(Number(p["costUsd"])) : null,
               p["durationMs"] !== undefined ? fmtDuration(Number(p["durationMs"])) : null,
             ]
               .filter(Boolean)
               .join(" · ");
-        return { ...base, icon: "◆", iconCls: "status", name, detail, mono: false, isStatus: true };
+        return { ...base, name: String(p["phase"] ?? "phase").replace("_", "-"), detail, mono: false };
+      }
+      case "diff": {
+        const n = Number(p["filesChanged"] ?? 0);
+        const detail =
+          n === 0
+            ? "no files changed"
+            : `${fmtInt(n)} file${n === 1 ? "" : "s"} changed · +${fmtInt(Number(p["additions"] ?? 0))} −${fmtInt(Number(p["deletions"] ?? 0))}`;
+        return { ...base, name: "git", detail, mono: false };
       }
       default:
-        return { ...base, icon: "·", iconCls: "", name: String(e.type), detail: JSON.stringify(p) };
+        return { ...base, name: String(e.type), detail: JSON.stringify(p) };
     }
   };
-}
-
-/** "mcp__claude_ai_Figma__get_screenshot" → "Figma · get_screenshot" */
-function shortToolName(name: string): string {
-  const m = /^mcp__(?:claude_ai_|plugin_)?(.+?)__(.+)$/.exec(name);
-  return m ? `${m[1]!.replace(/_/g, " ")} · ${m[2]}` : name;
-}
-
-function toolClass(name: string): string {
-  if (name === "Bash") return "sh";
-  if (name === "Edit" || name === "Write" || name === "MultiEdit" || name === "NotebookEdit") return "edit";
-  if (name === "Read" || name === "Grep" || name === "Glob") return "read";
-  if (name.startsWith("mcp__")) return "mcp";
-  return "";
-}
-
-/** Readable type labels instead of 10px glyphs. */
-function toolIcon(name: string): string {
-  if (name === "Bash") return "sh";
-  if (name === "Edit" || name === "Write" || name === "MultiEdit" || name === "NotebookEdit") return "edit";
-  if (name === "Read" || name === "Grep" || name === "Glob") return "read";
-  if (name.startsWith("mcp__")) return "mcp";
-  return "tool";
 }
 
 function shellQuote(arg: string, max?: number): string {

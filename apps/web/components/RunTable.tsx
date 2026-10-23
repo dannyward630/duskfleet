@@ -1,7 +1,18 @@
-import { wrapUpPhase } from "@duskfleet/core";
+import { runSilence, wrapUpPhase } from "@duskfleet/core";
 import Link from "next/link";
 import type { RunWithProject } from "@/lib/data";
-import { elapsedSince, fmtCost, fmtDuration, fmtRelative, fmtTime, runTitle, shortModel } from "@/lib/format";
+import {
+  billingNote,
+  elapsedSince,
+  fmtClock,
+  fmtCost,
+  fmtDuration,
+  fmtInt,
+  fmtRelative,
+  fmtTime,
+  runTitle,
+  shortModel,
+} from "@/lib/format";
 import { RunRow } from "./RunRow";
 import { StatusBadge } from "./StatusBadge";
 
@@ -10,8 +21,19 @@ import { StatusBadge } from "./StatusBadge";
  * prompt) is the identity of a run; agent, project and model are secondary.
  * Counters that only matter when debugging (turns, tool calls, tokens) live on
  * the detail page. Columns marked col-* collapse on narrow screens.
+ *
+ * `ended`: finished runs, so Duration / Ended (wall clock) instead of the live
+ * Elapsed / Started (relative).
  */
-export function RunTable({ runs, emptyText }: { runs: RunWithProject[]; emptyText: string }) {
+export function RunTable({
+  runs,
+  emptyText,
+  ended = false,
+}: {
+  runs: RunWithProject[];
+  emptyText: string;
+  ended?: boolean;
+}) {
   if (runs.length === 0) return <div className="empty">{emptyText}</div>;
   return (
     <table className="runs">
@@ -20,15 +42,18 @@ export function RunTable({ runs, emptyText }: { runs: RunWithProject[]; emptyTex
           <th>Status</th>
           <th>Run</th>
           <th className="col-model">Model</th>
-          <th className="num col-duration">Duration</th>
+          <th className="num col-duration">{ended ? "Duration" : "Elapsed"}</th>
+          <th className="num col-turns">Turns</th>
           <th className="num">Cost</th>
-          <th className="col-started">Started</th>
+          <th className="col-started">{ended ? "Ended" : "Started"}</th>
         </tr>
       </thead>
       <tbody>
         {runs.map((r) => {
-          const duration = r.status === "running" ? elapsedSince(r.startedAt) : r.durationMs;
+          const running = r.status === "running";
+          const duration = running ? elapsedSince(r.startedAt) : r.durationMs;
           const started = r.startedAt ?? r.createdAt;
+          const finished = r.endedAt ?? started;
           const href = `/runs/${r.id}`;
           const issues = `${href}#issues`;
           // The flags are the stored review reasons; the rule itself lives in core.
@@ -36,6 +61,7 @@ export function RunTable({ runs, emptyText }: { runs: RunWithProject[]; emptyTex
           const budget = reasons.includes("budget_exhausted");
           const orphaned = reasons.includes("orphaned");
           const wrapUp = budget ? wrapUpPhase(r) : null;
+          const silence = runSilence(r);
           return (
             <RunRow key={r.id} href={href}>
               <td className="status">
@@ -49,6 +75,23 @@ export function RunTable({ runs, emptyText }: { runs: RunWithProject[]; emptyTex
                   <Link href={`/?agent=${encodeURIComponent(r.agentId)}`}>{r.agentId}</Link>
                   <span className="sep">·</span>
                   <span title={r.projectPath}>{r.projectLabel}</span>
+                  {silence && (
+                    <span className="flags">
+                      <span
+                        className={`flag ${silence.level === "critical" ? "bad" : "warn"}`}
+                        title={`No stream-json output since ${fmtTime(r.lastEventAt ?? started)}. Informational: the run is not killed.`}
+                      >
+                        no output for {Math.floor(silence.silentMs / 60_000)} min
+                      </span>
+                    </span>
+                  )}
+                  {r.scheduleId && (
+                    <span className="flags">
+                      <Link href={`/schedules#${r.scheduleId}`} className="flag quiet badge-link" title={r.scheduleId}>
+                        scheduled
+                      </Link>
+                    </span>
+                  )}
                   {(r.permissionDenials ?? 0) > 0 && (
                     <span className="flags">
                       <Link
@@ -60,7 +103,7 @@ export function RunTable({ runs, emptyText }: { runs: RunWithProject[]; emptyTex
                             .join("\n") || "A tool call was denied"
                         }
                       >
-                        {r.permissionDenials} denied
+                        {r.permissionDenials} {r.permissionDenials === 1 ? "denial" : "denials"}
                       </Link>
                     </span>
                   )}
@@ -95,6 +138,16 @@ export function RunTable({ runs, emptyText }: { runs: RunWithProject[]; emptyTex
                       >
                         budget exhausted{wrapUp ? " · wrapped up" : ""}
                       </Link>
+                    </span>
+                  )}
+                  {r.kind === "gate" && (
+                    <span className="flags">
+                      <span
+                        className="flag warn"
+                        title="A schedule's gate agent: it only decides whether the tick has work. Its cost counts as gate spend."
+                      >
+                        gate
+                      </span>
                     </span>
                   )}
                   {r.resumedFromRunId && (
@@ -141,10 +194,19 @@ export function RunTable({ runs, emptyText }: { runs: RunWithProject[]; emptyTex
                 </span>
               </td>
               <td className="num col-duration">{fmtDuration(duration)}</td>
-              <td className="num">{fmtCost(r.costUsd)}</td>
-              <td className="when col-started" title={fmtTime(started)}>
-                {fmtRelative(started)}
+              <td className="num col-turns">{fmtInt(r.numTurns)}</td>
+              <td className="num" title={billingNote(r.billingType) ?? undefined}>
+                {running ? "–" : fmtCost(r.costUsd)}
               </td>
+              {ended ? (
+                <td className="when col-started" title={fmtTime(finished)}>
+                  {fmtClock(finished)}
+                </td>
+              ) : (
+                <td className="when col-started" title={fmtTime(started)}>
+                  {fmtRelative(started)}
+                </td>
+              )}
             </RunRow>
           );
         })}

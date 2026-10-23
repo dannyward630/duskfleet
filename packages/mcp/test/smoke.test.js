@@ -14,15 +14,20 @@ import { fileURLToPath } from "node:url";
 import "./helpers.js"; // before @duskfleet/core: drops an inherited CLAUDE_BIN
 
 import {
+  agentDefinitionHash,
+  billingTypeOf,
   budgetPlan,
   ClaudeCodeExecutor,
   loadConfig,
   looksLikeContextExhaustion,
+  mergeResults,
   needsReview,
   openDatabase,
+  REVIEW_REASON_LABELS,
   RunManager,
   RunRepository,
   reviewReasons,
+  runSilence,
   summarizeRun,
   WRAP_UP_PROMPT,
 } from "@duskfleet/core";
@@ -83,6 +88,9 @@ test("successful run is recorded with metrics", async () => {
     assert.deepEqual(started.command.argv.slice(0, 4), ["-p", "--output-format", "stream-json", "--verbose"]);
     assert.ok(started.command.argv.includes("--model") && started.command.argv.includes("haiku"));
     assert.ok(started.command.argv.includes("--append-system-prompt"));
+    assert.ok(!started.command.argv.includes("ok"), "the prompt goes on stdin: not in argv, not in command_json");
+    assert.ok(!started.command.argv.includes("--"), "no positional prompt left to guard");
+    assert.equal(started.prompt, "ok", "the prompt column keeps it");
 
     const run = await app.runs.waitForRun(started.id, 10_000);
     assert.equal(run.status, "completed");
@@ -106,6 +114,112 @@ test("successful run is recorded with metrics", async () => {
   }
 });
 
+test("billingTypeOf: an ANTHROPIC_API_KEY in the child's environment means api, else subscription", () => {
+  assert.equal(billingTypeOf({ ANTHROPIC_API_KEY: "sk-ant-test" }), "api");
+  assert.equal(billingTypeOf({}), "subscription");
+  assert.equal(billingTypeOf({ ANTHROPIC_API_KEY: "  " }), "subscription", "a blank key authenticates nothing");
+});
+
+test("billing_type is recorded when the run spawns and survives the reload", async () => {
+  const app = makeApp();
+  try {
+    const started = await app.runs.startRun({ prompt: "ok", projectPath: app.project });
+    const expected = billingTypeOf(process.env);
+    assert.equal(started.billingType, expected);
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.equal(run.billingType, expected);
+    assert.equal(summarizeRun(run).billingType, expected);
+    const raw = app.db.prepare("SELECT billing_type FROM runs WHERE id = ?").get(run.id);
+    assert.equal(raw.billing_type, expected);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("last_event_at is stamped when the run produces output", async () => {
+  const app = makeApp();
+  try {
+    const before = new Date().toISOString();
+    const started = await app.runs.startRun({ prompt: "ok", projectPath: app.project });
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.ok(run.lastEventAt, "set by the first stream-json event");
+    assert.ok(run.lastEventAt >= before && run.lastEventAt <= run.endedAt);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("runSilence: running rows only, 5 min suspicious, 15 min critical, start time before any event", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+  const ago = (min) => new Date(now - min * 60_000).toISOString();
+  const running = (lastEventAt, startedAt = ago(60)) => ({ status: "running", startedAt, lastEventAt });
+  assert.equal(runSilence(running(ago(4)), now), null);
+  assert.deepEqual(runSilence(running(ago(5)), now), { level: "suspicious", silentMs: 5 * 60_000 });
+  assert.equal(runSilence(running(ago(14)), now).level, "suspicious");
+  assert.equal(runSilence(running(ago(15)), now).level, "critical");
+  assert.equal(runSilence(running(null, ago(6)), now).level, "suspicious", "no event yet: silent since the start");
+  assert.equal(runSilence(running(null, ago(2)), now), null);
+  assert.equal(runSilence({ status: "completed", startedAt: ago(60), lastEventAt: ago(30) }, now), null);
+  assert.equal(runSilence({ status: "pending", startedAt: null, lastEventAt: null }, now), null);
+});
+
+test("eval bundle: agent_hash, model_used and claude_code_version are stored on the run", async () => {
+  const app = makeApp();
+  try {
+    const started = await app.runs.startRun({ prompt: "ok", projectPath: app.project, model: "haiku" });
+    assert.match(started.agentHash, /^[0-9a-f]{12}$/, "hashed at start, before the child runs");
+    assert.equal(started.claudeCodeVersion, null, "unknown until the init line");
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.equal(run.agentHash, started.agentHash);
+    assert.equal(run.modelUsed, "haiku");
+    assert.equal(run.claudeCodeVersion, "9.9.9", "from the init line of fake-claude.js");
+    const summary = summarizeRun(run);
+    assert.equal(summary.agentHash, run.agentHash);
+    assert.equal(summary.claudeCodeVersion, "9.9.9");
+    const raw = app.db.prepare("SELECT agent_hash, claude_code_version FROM runs WHERE id = ?").get(run.id);
+    assert.deepEqual({ ...raw }, { agent_hash: run.agentHash, claude_code_version: "9.9.9" });
+
+    // Same agent, same hash; an edit to the agent file changes it.
+    const again = await app.runs.startRun({ prompt: "ok", projectPath: app.project });
+    await app.runs.waitForRun(again.id, 10_000);
+    assert.equal(again.agentHash, run.agentHash);
+    writeFileSync(
+      path.join(app.root, "config", "agents", "coder.md"),
+      `---\npermission_mode: acceptEdits\n---\nBe briefer.\n`,
+    );
+    const edited = await app.runs.startRun({ prompt: "ok", projectPath: app.project });
+    await app.runs.waitForRun(edited.id, 10_000);
+    assert.notEqual(edited.agentHash, run.agentHash);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("agentDefinitionHash ignores where the agent was loaded from and covers a link's project agent file", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "duskfleet-hash-"));
+  try {
+    mkdirSync(path.join(root, ".claude", "agents"), { recursive: true });
+    const file = path.join(root, ".claude", "agents", "worker.md");
+    writeFileSync(file, "---\nname: worker\n---\nv1\n");
+    const base = {
+      id: "w",
+      name: "w",
+      description: "",
+      permissionMode: "dontAsk",
+      systemPrompt: "",
+      claudeAgent: "worker",
+    };
+    const a = agentDefinitionHash({ ...base, source: "builtin", sourcePath: "/a/w.md" }, root);
+    const b = agentDefinitionHash({ ...base, source: "user", sourcePath: "/b/w.md", model: undefined }, root);
+    assert.equal(a, b, "source, sourcePath and undefined fields do not count");
+    assert.notEqual(agentDefinitionHash({ ...base, source: "user", sourcePath: "", model: "haiku" }, root), a);
+    writeFileSync(file, "---\nname: worker\n---\nv2\n");
+    assert.notEqual(agentDefinitionHash({ ...base, source: "builtin", sourcePath: "/a/w.md" }, root), a);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("error result marks the run failed", async () => {
   const app = makeApp();
   try {
@@ -115,6 +229,39 @@ test("error result marks the run failed", async () => {
     assert.equal(run.exitCode, 1);
     assert.match(run.error, /API Error/);
     assert.equal(run.terminationReason, "api_error");
+    // A generic API error matches no failure code.
+    assert.equal(run.errorCode, null);
+    assert.equal(run.errorFamily, null);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("a max-turns stop is stored as error_code max_turns_exhausted", async () => {
+  const app = makeApp();
+  try {
+    const started = await app.runs.startRun({ prompt: "max-turns", projectPath: app.project });
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.equal(run.status, "failed");
+    assert.equal(run.errorCode, "max_turns_exhausted");
+    assert.equal(run.errorFamily, "limit");
+    assert.equal(run.errorDetail, null);
+    const summary = summarizeRun(run);
+    assert.equal(summary.errorCode, "max_turns_exhausted");
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("a non-zero exit after a non-error result does not classify the agent's prose", async () => {
+  const app = makeApp();
+  try {
+    const started = await app.runs.startRun({ prompt: "prose-exit", projectPath: app.project });
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.equal(run.status, "failed");
+    assert.match(run.error, /503 retry test/);
+    assert.equal(run.errorCode, null);
+    assert.equal(run.errorFamily, null);
   } finally {
     await app.cleanup();
   }
@@ -182,7 +329,17 @@ test("subagent invocations are recorded as run_agents rows with the persona hash
     const started = await app.runs.startRun({ prompt: "subagent", projectPath: app.project, model: "opus" });
     const run = await app.runs.waitForRun(started.id, 10_000);
     assert.equal(run.status, "completed");
-    assert.equal(run.modelUsed, "opus", "the subagent's haiku must not become the run model");
+    assert.equal(run.modelUsed, "mixed", "tokens on two models: neither the main model nor the subagent's haiku");
+    assert.equal(run.modelRequested, "opus");
+    assert.deepEqual(run.usageByModel, {
+      opus: { inputTokens: 22, outputTokens: 13, cacheReadTokens: 1200, cacheCreationTokens: 400 },
+      "claude-haiku-5-5": { inputTokens: 7, outputTokens: 60, cacheReadTokens: 500, cacheCreationTokens: 300 },
+    });
+    assert.deepEqual(
+      [run.inputTokens, run.outputTokens, run.cacheReadTokens, run.cacheCreationTokens],
+      [29, 73, 1700, 700],
+      "totals are the modelUsage sum, subagent included, not the main-session `usage`",
+    );
     assert.equal(run.resultText, "Reviewer found two issues.");
     assert.equal(run.toolCalls, 3, "Agent call + two subagent tool calls");
 
@@ -546,6 +703,32 @@ test("max_concurrent must be a whole number >= 1", () => {
   }
 });
 
+test("daily caps load from frontmatter and are validated", async () => {
+  const app = makeApp({ agents: { capped: `---\nmax_daily_runs: 3\nmax_daily_cost_usd: 1.5\n---\nx\n` } });
+  try {
+    const a = app.config.agents.get("capped");
+    assert.equal(a.maxDailyRuns, 3);
+    assert.equal(a.maxDailyCostUsd, 1.5);
+  } finally {
+    await app.cleanup();
+  }
+  for (const [key, bad, msg] of [
+    ["max_daily_runs", "0", /max_daily_runs must be a whole number >= 1/],
+    ["max_daily_runs", "2.5", /max_daily_runs must be a whole number >= 1/],
+    ["max_daily_cost_usd", "0", /max_daily_cost_usd must be a number > 0/],
+    ["max_daily_cost_usd", '"lots"', /max_daily_cost_usd must be a number > 0/],
+  ]) {
+    assert.throws(
+      () => makeApp({ agents: { broken: `---\n${key}: ${bad}\n---\nx\n` } }),
+      (err) => {
+        assert.match(err.message, new RegExp(`invalid agent file .*broken\\.md: ${key}: `));
+        assert.match(err.message, msg);
+        return true;
+      },
+    );
+  }
+});
+
 test("MCP servers mounted and allow-list mismatches are recorded on the run", async () => {
   const app = makeApp();
   try {
@@ -562,12 +745,87 @@ test("MCP servers mounted and allow-list mismatches are recorded on the run", as
       .events(run.id)
       .filter((e) => e.type === "note")
       .map((e) => e.payload.message);
-    assert.equal(notes.length, 1);
-    assert.match(notes[0], /never mounted.*mcp__plugin_productivity_atlassian.*mounted: mcp__claude_ai_Figma/);
+    // The plugin-named server is absent from the very first init, so the process was restarted once
+    // (for nothing: a name mismatch is the same on every start) before the mismatch was recorded.
+    assert.equal(notes.length, 2);
+    assert.match(notes[0], /init reported no server for mcp__plugin_productivity_atlassian.*restarted once/);
+    assert.match(notes[1], /never mounted.*mcp__plugin_productivity_atlassian.*mounted: mcp__claude_ai_Figma/);
     const summary = summarizeRun(app.runs.listRuns({ limit: 1 })[0]);
     assert.equal(summary.id, run.id);
     assert.equal(summary.needsReview, true);
     assert.deepEqual(summary.mcpAllowListedMissing, ["mcp__plugin_productivity_atlassian"]);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("a child whose init lacks an allow-listed connector is restarted once, before any model turn", async () => {
+  const app = makeApp({
+    agents: {
+      figma: `---\npermission_mode: dontAsk\ninherit_mcp: true\nallowed_tools: ["mcp__claude_ai_Figma__get_metadata"]\n---\nUse Figma.\n`,
+      strict: `---\npermission_mode: dontAsk\nallowed_tools: ["mcp__claude_ai_Figma"]\n---\nNo MCP inherited.\n`,
+    },
+  });
+  const spawns = () => Number(readFileSync(path.join(app.project, "fake-claude-spawns"), "utf8"));
+  try {
+    // First init: only the project's own server. Second: the connector is there; the run goes on with it.
+    const started = await app.runs.startRun({ prompt: "mcp-missing-once", projectPath: app.project, agentId: "figma" });
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.equal(run.status, "completed");
+    assert.equal(spawns(), 2);
+    assert.deepEqual(run.mcp.mounted, [{ name: "claude.ai Figma", status: "connected" }]);
+    assert.deepEqual(run.mcp.allowListedMissing, []);
+    assert.deepEqual(run.reviewReasons, []);
+    assert.notEqual(run.claudeSessionId, started.claudeSessionId, "the second process gets a fresh session id");
+    const notes = app.runs.events(run.id).filter((e) => e.type === "note");
+    assert.equal(notes.length, 1);
+    assert.match(notes[0].payload.message, /init reported no server for mcp__claude_ai_Figma \(mounted: duskfleet\)/);
+    assert.deepEqual(notes[0].payload.mcpRestart.missing, ["mcp__claude_ai_Figma"]);
+    assert.equal(notes[0].payload.mcpRestart.sessionId, run.claudeSessionId);
+    assert.equal(app.runs.events(run.id).filter((e) => e.type === "init").length, 2);
+    const log = readFileSync(run.logPath, "utf8");
+    assert.match(log, /^#restart mcp__claude_ai_Figma /m);
+    assert.equal(log.match(/"subtype":"init"/g).length, 2);
+    assert.equal(run.costUsd, 0.0123, "only the second process's result counts");
+    rmSync(path.join(app.project, "fake-claude-spawns"));
+
+    // Still missing after the restart: the second process is kept and the run is flagged as before.
+    const again = await app.runs.startRun({ prompt: "mcp-missing", projectPath: app.project, agentId: "figma" });
+    const flagged = await app.runs.waitForRun(again.id, 10_000);
+    assert.equal(flagged.status, "completed");
+    assert.equal(spawns(), 2, "one restart, never a loop");
+    assert.deepEqual(flagged.mcp.allowListedMissing, ["mcp__claude_ai_Figma"]);
+    assert.deepEqual(flagged.reviewReasons, ["mcp_missing"]);
+    assert.equal(app.runs.events(flagged.id).filter((e) => e.type === "note").length, 2);
+    rmSync(path.join(app.project, "fake-claude-spawns"));
+
+    // Without inherit_mcp nothing could mount anyway: no restart.
+    const strict = await app.runs.startRun({ prompt: "mcp-missing", projectPath: app.project, agentId: "strict" });
+    const plain = await app.runs.waitForRun(strict.id, 10_000);
+    assert.equal(plain.status, "completed");
+    assert.equal(spawns(), 1);
+    assert.deepEqual(plain.mcp.allowListedMissing, ["mcp__claude_ai_Figma"]);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("a cancel during the restart wins: no second process", async () => {
+  const app = makeApp({
+    agents: {
+      figma: `---\npermission_mode: dontAsk\ninherit_mcp: true\nallowed_tools: ["mcp__claude_ai_Figma"]\n---\nUse Figma.\n`,
+    },
+  });
+  try {
+    const started = await app.runs.startRun({ prompt: "mcp-missing-once", projectPath: app.project, agentId: "figma" });
+    // Cancel as soon as the first init is in (the restart is decided there): whichever process is
+    // alive by then, the first on its way down or the second just started, the cancel is the verdict.
+    while (!app.runs.events(started.id).some((e) => e.type === "init")) await new Promise((r) => setTimeout(r, 1));
+    app.runs.cancelRun(started.id);
+    const run = await app.runs.waitForRun(started.id, 10_000);
+    assert.equal(run.status, "cancelled");
+    assert.deepEqual(run.reviewReasons, []);
+    assert.ok(Number(readFileSync(path.join(app.project, "fake-claude-spawns"), "utf8")) <= 2);
   } finally {
     await app.cleanup();
   }
@@ -698,7 +956,7 @@ test("the wrap-up pass runs claude --resume with the reserve budget and the fixe
     assert.equal(argv[r + 1], started.claudeSessionId);
     assert.ok(!argv.includes("--session-id"), "a resumed pass never passes --session-id");
     assert.equal(argv[argv.indexOf("--max-budget-usd") + 1], "0.5");
-    assert.equal(argv[argv.length - 1], WRAP_UP_PROMPT);
+    assert.ok(!argv.includes(WRAP_UP_PROMPT), "the wrap-up prompt goes on stdin, never argv");
   } finally {
     await app.cleanup();
   }
@@ -905,6 +1163,18 @@ test("needs review: every run that ended before the agent chose to stop, from on
   assert.deepEqual(reviewReasons({ ...base, permissionDenials: 2, humanIntervention: true }), ["permission_denied"]);
   assert.deepEqual(reviewReasons({ ...base, contextExhausted: true }), ["context_exhausted"]);
   assert.deepEqual(reviewReasons({ ...base, mcp: { allowListedMissing: ["mcp__x"] } }), ["mcp_missing"]);
+  assert.deepEqual(reviewReasons({ ...base, toolCalls: 0 }), ["empty_run"], "completed with no tool call");
+  assert.deepEqual(reviewReasons({ ...base, toolCalls: 1 }), [], "one tool call is work");
+  assert.deepEqual(reviewReasons({ ...base, toolCalls: null }), [], "unknown tool calls are not empty");
+  assert.deepEqual(
+    reviewReasons({ ...base, status: "failed", exitCode: 1, terminationReason: "api_error", toolCalls: 0 }),
+    ["nonzero_exit"],
+    "only a completed run can be empty",
+  );
+  assert.deepEqual(
+    reviewReasons({ ...base, status: "cancelled", terminationReason: null, exitCode: null, toolCalls: 0 }),
+    [],
+  );
   assert.deepEqual(
     reviewReasons({ ...base, status: "cancelled", terminationReason: null, exitCode: null }),
     [],
@@ -915,6 +1185,31 @@ test("needs review: every run that ended before the agent chose to stop, from on
     reviewReasons({ ...base, status: "failed", exitCode: 1, terminationReason: "api_error", error: "API Error" }),
     ["nonzero_exit"],
   );
+});
+
+test("a completed run with no tool call is stored as needs review (empty_run), a run with one is green", async () => {
+  const app = makeApp();
+  try {
+    const empty = await app.runs.waitForRun(
+      (await app.runs.startRun({ prompt: "empty", projectPath: app.project })).id,
+      15_000,
+    );
+    assert.equal(empty.status, "completed");
+    assert.equal(empty.toolCalls, 0);
+    assert.deepEqual(empty.reviewReasons, ["empty_run"], "stored on the row at the terminal transition");
+    assert.equal(summarizeRun(empty).needsReview, true);
+    assert.equal(REVIEW_REASON_LABELS.empty_run, "no work done");
+
+    const ok = await app.runs.waitForRun(
+      (await app.runs.startRun({ prompt: "ok", projectPath: app.project })).id,
+      15_000,
+    );
+    assert.equal(ok.status, "completed");
+    assert.ok(ok.toolCalls > 0);
+    assert.deepEqual(ok.reviewReasons, []);
+  } finally {
+    await app.cleanup();
+  }
 });
 
 test("needs review is true for budget, timeout, crash and orphan runs, and false for a cancelled one", async () => {
@@ -976,6 +1271,81 @@ test("needs review is true for budget, timeout, crash and orphan runs, and false
   }
 });
 
+test("mergeResults keeps usageByModel summing to the totals across the wrap-up pass", () => {
+  const u = (i, o) => ({ inputTokens: i, outputTokens: o, cacheReadTokens: null, cacheCreationTokens: null });
+  const pass = (over) => ({
+    outcome: "completed",
+    model: "claude-haiku-5-5",
+    startedAt: "2026-10-20T10:00:00.000Z",
+    endedAt: "2026-10-20T10:01:00.000Z",
+    resultText: null,
+    numTurns: 1,
+    toolCalls: 0,
+    usage: u(10, 5),
+    usageByModel: { "claude-haiku-5-5": u(10, 5) },
+    costUsd: 0.01,
+    permissionDenials: 0,
+    deniedTools: [],
+    contextExhausted: false,
+    subagents: [],
+    ...over,
+  });
+  const sumOf = (map) =>
+    Object.values(map).reduce((s, x) => ({ i: s.i + (x.inputTokens ?? 0), o: s.o + (x.outputTokens ?? 0) }), {
+      i: 0,
+      o: 0,
+    });
+
+  // Wrap-up without modelUsage: its tokens go under its own model.
+  const a = mergeResults(pass({}), pass({ usage: u(3, 2), usageByModel: null }));
+  assert.deepEqual(sumOf(a.usageByModel), { i: a.usage.inputTokens, o: a.usage.outputTokens });
+  assert.equal(a.model, "claude-haiku-5-5");
+
+  // Wrap-up on another model without modelUsage: both models, mixed.
+  const b = mergeResults(pass({}), pass({ model: "claude-sonnet-5", usage: u(3, 2), usageByModel: null }));
+  assert.deepEqual(Object.keys(b.usageByModel).sort(), ["claude-haiku-5-5", "claude-sonnet-5"]);
+  assert.equal(b.model, "mixed");
+
+  // Wrap-up whose tokens cannot be attributed: no partial map.
+  const c = mergeResults(pass({}), pass({ model: null, usage: u(3, 2), usageByModel: null }));
+  assert.equal(c.usageByModel, null);
+  assert.equal(c.usage.inputTokens, 13);
+
+  // Wrap-up that spent nothing measurable leaves the main map as is.
+  const d = mergeResults(pass({}), pass({ model: null, usage: u(null, null), usageByModel: null }));
+  assert.deepEqual(d.usageByModel, { "claude-haiku-5-5": u(10, 5) });
+});
+
+test("mergeResults: a wrap-up cancel drops the failure code, otherwise main's wins over the wrap-up's", () => {
+  const quota = { code: "provider_quota", family: "limit", detail: null };
+  const overloaded = { code: "transient_upstream", family: "transient", detail: null };
+  const pass = (over) => ({
+    outcome: "failed",
+    model: "claude-haiku-5-5",
+    startedAt: "2026-10-20T10:00:00.000Z",
+    endedAt: "2026-10-20T10:01:00.000Z",
+    resultText: null,
+    numTurns: 1,
+    toolCalls: 0,
+    usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: null, cacheCreationTokens: null },
+    usageByModel: null,
+    costUsd: 0.01,
+    permissionDenials: 0,
+    deniedTools: [],
+    contextExhausted: false,
+    failure: null,
+    subagents: [],
+    ...over,
+  });
+
+  const cancelled = mergeResults(pass({ failure: quota }), pass({ outcome: "cancelled" }));
+  assert.equal(cancelled.outcome, "cancelled");
+  assert.equal(cancelled.failure, null);
+
+  assert.deepEqual(mergeResults(pass({ failure: quota }), pass({ failure: overloaded })).failure, quota);
+  assert.deepEqual(mergeResults(pass({}), pass({ failure: overloaded })).failure, overloaded);
+});
+
 test("context exhaustion is detected from structured signals, not from prose", () => {
   const base = {
     isError: false,
@@ -988,6 +1358,7 @@ test("context exhaustion is detected from structured signals, not from prose", (
     durationMs: 1,
     costUsd: 0,
     usage: {},
+    usageByModel: null,
     permissionDenials: 0,
     deniedTools: [],
     modelUsed: null,

@@ -14,15 +14,24 @@ in the nav); the other pages are static.
 
 - **Runs**: KPI cards (clean runs, needs review, spend) computed on the current filter; project /
   agent chips, prompt search (`?q=`), `?schedule=` and `?limit=` (load older). Runs are identified
-  by a short title (first line of the prompt); the whole row links to the detail.
-- **Run detail**: short title, status line, duration / cost / turns / tool calls / tokens, the
-  issues (denied calls highlighted in the timeline, missing MCP servers, context exhaustion),
+  by a short title (first line of the prompt); the whole row links to the detail. A running run
+  that produced no stream-json output for 5 minutes shows a "no output for N min" flag (amber,
+  red from 15 minutes; since the start when it never produced any). Informational only: nothing
+  kills the run. The timestamp is `last_event_at`, written at most every 15 seconds.
+- **Run detail**: short title, status line, duration / cost / turns / tool calls / tokens (a
+  subscription run's cost is labelled "reported, not billed"; an API key run's is billed, see
+  [`billingType`](cli.md#what-a-run-records); the list's cost cell says the same on hover), the
+  issues (denied calls highlighted in the timeline, missing MCP servers, context exhaustion,
+  the error labelled with its [`errorCode`](cli.md#what-a-run-records) and the quota reset time,
+  a "Claude is not logged in" callout with the login link for `auth_required`, a refusal warning),
   the linked retry when the run resumed an earlier one or was resumed by a later one
   (`on_failure: resume_once`; the list shows "resumes ↗" / "retried ↗" flags),
   final message (long results collapse), a callout when a budget exhaustion was followed by a
   wrap-up pass (what the main pass spent, what the wrap-up cost and whether it recorded where
   it stopped; the wrap-up's own tool calls sit between `wrap-up started` / `wrap-up ended`
-  rows of the timeline), event timeline with legend and grouped repeats,
+  rows of the timeline), a **Changes** section when the project is a git checkout (files the
+  run changed with lines added / deleted, the base commit, a link to the patch at
+  `/runs/<id>/diff`), event timeline with legend and grouped repeats,
   previous / next run of the same agent, a "run again" CLI command, the `claude --resume`
   command and the exact command executed. Home paths print as `~/…`; Copy buttons give the
   full value.
@@ -31,15 +40,30 @@ in the nav); the other pages are static.
   past 4 entries), limits (timeout, budget and the wrap-up reserve), prompt preview and
   aggregate stats. User agents can be deleted or
   unlinked from here, with an inline confirmation; builtins are read-only.
-- **Schedules**: state, cron (human and raw), next tick (theoretical one for paused schedules),
-  last outcome and firing history, the state of the run it last started, the on-failure policy
-  in force and a "next: resume" badge when the next fire will resume that run. Each row can be run now, paused / resumed, have its cron and
-  time zone edited, or be deleted (inline confirmation); the changes go through the same
-  validation as `update_schedule`. **Run now** does not start Claude from the dashboard: it marks
-  the row and the process that holds the scheduler lease fires it on its next tick (within
-  `tick_seconds`, paused or not, busy = skip), so it waits while no process ticks. The badge says which kind of process ticks (service, MCP host) and
-  warns when only an MCP host does, with the `install-service` command. Creating a schedule and
-  changing its agent, project, prompt or model stay on MCP (copyable `create_schedule` example).
+- **Schedules**: a status strip (kill switch, lease holder and when its lease expires, next
+  firing, last 7 days fired / skipped busy), then the schedules grouped by project (the
+  schedule's own, else its agent's; "no project" last), one card each: cron (raw and in plain words), agent, model, the
+  [gate](schedules.md#gates-skip-cheaply-when-there-is-no-work) and on-failure policy in force, the
+  prompt, the last 10 firings as squares coloured by how the run they started **ended** (clean,
+  needs review from the stored review reasons, failed, running, cancelled, skipped busy, skipped by
+  the gate, run gone), and a footer with the next tick (theoretical one for paused schedules), the
+  fired / skipped counters, the [idle cost](schedules.md#idle-cost) over 7 days (no-op runs out of
+  all runs and the dollars they cost, amber when at least half were no-ops), what the gate skipped
+  and cost, and the last error. A "next: resume" badge says the next fire will resume the last run
+  (`on_failure: resume_once`). Each card can be run now, paused / resumed, have its cron and time
+  zone edited, or be deleted (inline confirmation); the changes go through the same validation as
+  `update_schedule`. **Run now** does not start Claude from the dashboard: it marks the row and the
+  process that holds the scheduler lease fires it on its next tick (within `tick_seconds`, paused
+  or not, busy = skip), so it waits while no process ticks. A callout warns when only an MCP host
+  ticks, with the `install-service` command. Creating a schedule and changing its agent, project,
+  prompt, model, gate or on-failure policy stay on MCP (copyable `create_schedule` example).
+- **Spent** (Runs page) splits into "on runs" and "on gates" once a gate agent has run; gate
+  runs carry a `gate` flag in the run list and are left out of the run counts (total, clean,
+  failed, needs review): a gate is a yes/no check, not work.
+- **Budgets** (Runs page): one banner per [monthly budget](agents.md#monthly-budgets) past its
+  `warn_percent` (amber) or spent (coral when `hard_stop` refuses runs and has paused the
+  scope's schedules; amber when it only warns). Nothing shows while every budget is `ok`. A
+  tick refused by a budget shows as "skipped, monthly budget spent" in the schedule's strip.
 - **MCP**: the tool catalogue (`packages/mcp/dist/tools.json`, generated at build time from the
   real server) with a sticky index, plus the registration snippets for Claude Desktop and
   Claude Code with your absolute paths.
@@ -64,6 +88,10 @@ the agent chose to stop, or when something silently narrowed what it could do:
 | `permission_denied` | a tool call was refused: the allow-list is incomplete |
 | `context_exhausted` | structured signal that the context window ran out |
 | `mcp_missing` | an allow-listed MCP server never mounted |
+| `empty_run` | the run completed with zero tool calls ("no work done"; the same signal the schedule auto-pause counts as empty). Structured only: the result text is never read |
+
+A run that used tools but never edited a file (a read-only reviewer, a planner) is not empty
+and stays green. Rows finished before `empty_run` existed keep the reasons they were stored with.
 
 A completed run with a reason is **needs review** (amber), never plain green; a failed or
 timed-out run is red and its badge title names the reasons. `cancelled` is not a reason: a

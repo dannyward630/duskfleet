@@ -95,7 +95,7 @@ export function registerRunTools(server: McpServer, ctx: ToolContext): void {
       description:
         "Fetch a run by id: status, timings, Claude session id, model, tokens, cost, tool calls, errors, " +
         "the command to resume the session and the subagents it delegated to (one entry per Agent call: type, brief, " +
-        "report, tools, model, tokens). Set include_output to get the full final message, full subagent briefs and reports, and the event timeline.",
+        "report, tools, model, tokens), and `diff`: what the run changed in a git checkout (files, lines added / deleted, path of the patch). Set include_output to get the full final message, full subagent briefs and reports, and the event timeline.",
       inputSchema: {
         run_id: z.string().describe("Run id returned by run_agent or list_runs"),
         include_output: z.boolean().optional().describe("Include the full final message and the event timeline"),
@@ -108,10 +108,12 @@ export function registerRunTools(server: McpServer, ctx: ToolContext): void {
       const subagents = ctx.runs.agents(run_id).map((s) => presentSubagent(s, Boolean(include_output)));
       /** The run that continued this one's session after a budget / timeout failure (on_failure: resume_once), or null. */
       const resumedByRunId = ctx.runs.resumedBy(run_id)?.id ?? null;
+      /** What the run changed in its git checkout (files, line counts, patch path), or null. */
+      const diff = ctx.runs.diff(run_id);
       return jsonResult(
         include_output
-          ? { ...view, resumedByRunId, subagents, events: ctx.runs.events(run_id) }
-          : { ...view, resumedByRunId, subagents },
+          ? { ...view, resumedByRunId, diff, subagents, events: ctx.runs.events(run_id) }
+          : { ...view, resumedByRunId, diff, subagents },
       );
     },
   );
@@ -123,6 +125,10 @@ export function registerRunTools(server: McpServer, ctx: ToolContext): void {
       description: "List recent runs, newest first, with optional filters.",
       inputSchema: {
         status: z.enum(RUN_STATUSES).optional().describe("Only runs in this status"),
+        kind: z
+          .enum(["run", "gate"])
+          .optional()
+          .describe("Only real runs, or only schedule gate-agent runs; both by default"),
         agent_id: z.string().optional().describe("Only runs of this agent (id from list_agents)"),
         project_path: z.string().optional().describe("Exact resolved project path"),
         limit: z.number().int().min(1).max(200).optional().describe("Default 20"),
@@ -131,6 +137,7 @@ export function registerRunTools(server: McpServer, ctx: ToolContext): void {
     async (args) => {
       const filter: Parameters<typeof ctx.runs.listRuns>[0] = {};
       if (args.status !== undefined) filter.status = args.status;
+      if (args.kind !== undefined) filter.kind = args.kind;
       if (args.agent_id !== undefined) filter.agentId = args.agent_id;
       if (args.project_path !== undefined) filter.projectPath = args.project_path;
       if (args.limit !== undefined) filter.limit = args.limit;

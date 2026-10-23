@@ -5,7 +5,9 @@
  * Fails when
  *   1. an MCP tool the server registers has no row in the tools table of docs/mcp-server.md
  *      (a line starting with "| `<tool>` |"), or
- *   2. a docs/*.md page is not linked from README.md.
+ *   2. a member of the ScheduleOutcome union (packages/core/src/scheduler/types.ts) is not
+ *      named in docs/mcp-server.md, or
+ *   3. a docs/*.md page is not linked from README.md.
  *
  * Tool names come from the generated catalogue packages/mcp/dist/tools.json (written by
  * `npm run build`), so this script never imports the server. Run it after the build.
@@ -37,7 +39,22 @@ for (const tool of tools) {
   if (!documented.has(tool)) problems.push(`docs/mcp-server.md: MCP tool \`${tool}\` has no row in the tools table`);
 }
 
-// 2. Every docs page is linked from README.md.
+// 2. Every ScheduleOutcome member is named in docs/mcp-server.md (the list_schedules row).
+// Read from the TypeScript source with a regex, so the check needs no import of core.
+const typesFile = path.join(root, "packages", "core", "src", "scheduler", "types.ts");
+const union = /export type ScheduleOutcome\s*=([^;]+);/.exec(readFileSync(typesFile, "utf8"));
+if (!union) {
+  problems.push("packages/core/src/scheduler/types.ts: `export type ScheduleOutcome = ...;` not found");
+} else {
+  const outcomes = [...union[1].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+  for (const outcome of outcomes) {
+    if (!mcpDoc.includes(`\`${outcome}\``)) {
+      problems.push(`docs/mcp-server.md: schedule outcome \`${outcome}\` (ScheduleOutcome) is not listed`);
+    }
+  }
+}
+
+// 3. Every docs page is linked from README.md.
 const readme = readFileSync(path.join(root, "README.md"), "utf8");
 const linked = new Set([...readme.matchAll(/\]\((?:\.\/)?docs\/([^)#\s]+\.md)(?:#[^)\s]*)?\)/g)].map((m) => m[1]));
 const pages = readdirSync(path.join(root, "docs"))
@@ -50,7 +67,9 @@ for (const page of pages) {
 if (problems.length) {
   console.error(`check-docs: ${problems.length} problem(s):\n`);
   for (const p of problems) console.error(`  ${p}`);
-  console.error("\nDocument the tool in docs/mcp-server.md and link every docs page from README.md.");
+  console.error(
+    "\nDocument every tool and schedule outcome in docs/mcp-server.md and link every docs page from README.md.",
+  );
   process.exit(1);
 }
 console.log(`check-docs: ${tools.length} MCP tools documented, ${pages.length} docs pages linked from README.md.`);

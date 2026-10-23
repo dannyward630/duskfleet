@@ -14,7 +14,19 @@ import {
 import { isResumable, type LastRunSummary, lastRunSummary, type Run } from "../observability/run.js";
 import type { ScheduleRepository } from "../storage/schedules.js";
 import { assertTimeZone, CronError, nextFire, parseCron } from "./cron.js";
-import type { Schedule, ScheduleInput, SchedulePatch } from "./types.js";
+import { validateGate } from "./gate.js";
+import { parseNoopPattern } from "./idle.js";
+import {
+  CATCH_UP_CAP,
+  CATCH_UP_POLICIES,
+  CONCURRENCY_POLICIES,
+  DEFAULT_CATCH_UP_POLICY,
+  DEFAULT_CONCURRENCY_POLICY,
+  IMPLEMENTED_CATCH_UP_POLICIES,
+  type Schedule,
+  type ScheduleInput,
+  type SchedulePatch,
+} from "./types.js";
 
 export const DEFAULT_TIME_ZONE = "Europe/London";
 
@@ -52,6 +64,38 @@ export function validateScheduleInput(config: DuskFleetConfig, input: ScheduleIn
   if (input.resumeBudgetUsd != null && !(Number.isFinite(input.resumeBudgetUsd) && input.resumeBudgetUsd > 0)) {
     throw new Error("resume_budget_usd must be a positive number");
   }
+  if (input.noopPattern != null) parseNoopPattern(input.noopPattern);
+  if (input.gate != null) validateGate(config, input.gate, scheduleProjectId(input, agent));
+  validatePolicies(input);
+}
+
+/** concurrency_policy and catch_up_policy: known values, and only the ones the scheduler implements. */
+function validatePolicies(input: Pick<ScheduleInput, "concurrencyPolicy" | "catchUpPolicy">): void {
+  const concurrency = input.concurrencyPolicy ?? DEFAULT_CONCURRENCY_POLICY;
+  if (!(CONCURRENCY_POLICIES as readonly string[]).includes(concurrency)) {
+    throw new Error(`concurrency_policy must be one of ${CONCURRENCY_POLICIES.join(", ")}`);
+  }
+  const catchUp = input.catchUpPolicy ?? DEFAULT_CATCH_UP_POLICY;
+  if (!(CATCH_UP_POLICIES as readonly string[]).includes(catchUp)) {
+    throw new Error(`catch_up_policy must be one of ${CATCH_UP_POLICIES.join(", ")}`);
+  }
+  if (!IMPLEMENTED_CATCH_UP_POLICIES.includes(catchUp)) {
+    throw new Error(
+      `catch_up_policy ${catchUp} is not implemented yet (planned: replay up to ${CATCH_UP_CAP} missed ticks, never for sub-hourly schedules); use ${IMPLEMENTED_CATCH_UP_POLICIES.join(", ")}`,
+    );
+  }
+}
+
+/**
+ * The project a schedule runs on: its own project_id when set, else the project its agent is
+ * bound to, else null (an unbound agent without a schedule project, or a deleted agent).
+ * The scheduler, the MCP / CLI listings and the dashboard grouping all use this one rule.
+ */
+export function scheduleProjectId(
+  schedule: { projectId?: string | null },
+  agent: Pick<AgentDefinition, "project"> | undefined,
+): string | null {
+  return schedule.projectId ?? agent?.project ?? null;
 }
 
 /** The policy a schedule applies after a failed run: its own, else its agent's, else none. */
@@ -89,7 +133,7 @@ export function willResume(
   if (!isResumable(lastRun) || lastRun.resumedFromRunId !== null || alreadyResumed) return false;
   return (
     lastRun.agentId === schedule.agentId &&
-    lastRun.projectId === (schedule.projectId ?? agent?.project ?? null) &&
+    lastRun.projectId === scheduleProjectId(schedule, agent) &&
     lastRun.prompt === schedule.prompt.trim() &&
     lastRun.modelRequested === (schedule.model ?? null)
   );
@@ -105,6 +149,11 @@ export interface ScheduleRunState {
   onFailureSource: "schedule" | "agent" | "default";
   /** Set when the next fire resumes this run instead of starting fresh. */
   willResumeRunId: string | null;
+  /**
+   * The project the schedule runs on (scheduleProjectId): its stored projectId, else its
+   * agent's project. projectId keeps the stored value, null for a bound agent.
+   */
+  effectiveProjectId: string | null;
 }
 
 /**
@@ -124,6 +173,7 @@ export function scheduleRunState(
     effectiveOnFailure: effectiveOnFailure(schedule, agent),
     onFailureSource: schedule.onFailure ? "schedule" : agent?.onFailure ? "agent" : "default",
     willResumeRunId: resume ? last.id : null,
+    effectiveProjectId: scheduleProjectId(schedule, agent),
   };
 }
 
@@ -140,7 +190,10 @@ export function createSchedule(
   return repo.insert({ ...input, timeZone, nextRunAt });
 }
 
-/** Merge a patch into an existing schedule. Resuming (`enabled: true`) recomputes next_run_at from `now`. */
+/**
+ * Merge a patch into an existing schedule. Resuming (`enabled: true`) recomputes next_run_at from
+ * `now` and clears an auto-pause reason (auto_paused_at stays: older runs do not count again).
+ */
 export function updateSchedule(
   repo: ScheduleRepository,
   config: DuskFleetConfig,
@@ -161,12 +214,40 @@ export function updateSchedule(
     enabled: patch.enabled ?? existing.enabled,
     onFailure: patch.onFailure === undefined ? existing.onFailure : patch.onFailure,
     resumeBudgetUsd: patch.resumeBudgetUsd === undefined ? existing.resumeBudgetUsd : patch.resumeBudgetUsd,
+    noopPattern: patch.noopPattern === undefined ? existing.noopPattern : patch.noopPattern,
+    gate: patch.gate === undefined ? existing.gate : patch.gate,
+    concurrencyPolicy: patch.concurrencyPolicy ?? existing.concurrencyPolicy,
+    catchUpPolicy: patch.catchUpPolicy ?? existing.catchUpPolicy,
   };
   validateScheduleInput(config, merged);
   if (merged.name !== existing.name && repo.findByName(merged.name))
     throw new Error(`a schedule named "${merged.name}" already exists`);
   const nextRunAt = merged.enabled ? nextRunAtFor(merged.cron, merged.timeZone!, now) : null;
-  return repo.update(id, { ...merged, nextRunAt });
+  return repo.update(id, { ...merged, nextRunAt, ...(merged.enabled ? { pausedReason: null } : {}) });
+}
+
+/**
+ * The reason to auto-pause a schedule before its next scheduled fire, or null to fire: its last
+ * `limit` ended runs (created after its previous auto-pause) all completed with 0 tool calls or
+ * ended needs review. Fewer ended runs than `limit`, or `limit` 0, never pauses. A cancelled or
+ * clean run breaks the streak.
+ */
+export function autoPauseReason(
+  repo: Pick<ScheduleRepository, "recentEndedRuns">,
+  schedule: Pick<Schedule, "id" | "autoPausedAt">,
+  limit: number,
+): string | null {
+  if (!(limit > 0)) return null;
+  const runs = repo.recentEndedRuns(schedule.id, schedule.autoPausedAt, limit);
+  if (runs.length < limit || !runs.every((r) => r.empty || r.needsReview)) return null;
+  // An empty run is needs-review too (reason empty_run): count it as empty, not as review.
+  const empty = runs.filter((r) => r.empty).length;
+  const review = runs.filter((r) => r.needsReview && !r.empty).length;
+  const parts = [
+    ...(empty > 0 ? [`${empty} completed with 0 tool calls`] : []),
+    ...(review > 0 ? [`${review} needed review`] : []),
+  ];
+  return `auto-paused: the last ${limit} runs did no useful work (${parts.join(", ")}); last run ${runs[0]!.id}`;
 }
 
 /**

@@ -26,6 +26,17 @@ export const maxConcurrentSchema = z
   .int("max_concurrent must be a whole number >= 1")
   .min(1, "max_concurrent must be a whole number >= 1");
 
+/** Per-agent daily run cap (UTC day): a whole number of runs, at least 1. */
+export const maxDailyRunsSchema = z
+  .number({ error: "max_daily_runs must be a whole number >= 1" })
+  .int("max_daily_runs must be a whole number >= 1")
+  .min(1, "max_daily_runs must be a whole number >= 1");
+
+/** Per-agent daily spend cap (UTC day), in USD. */
+export const maxDailyCostUsdSchema = z
+  .number({ error: "max_daily_cost_usd must be a number > 0" })
+  .positive("max_daily_cost_usd must be a number > 0");
+
 /** Everything an agent file can contain, flattened (frontmatter + body). */
 export const agentSpecSchema = z.object({
   id: z.string().regex(AGENT_ID_PATTERN, "agent id must be lowercase letters, digits, - or _"),
@@ -47,6 +58,8 @@ export const agentSpecSchema = z.object({
   project: z.string().min(1).optional(),
   max_concurrent: maxConcurrentSchema.optional(),
   isolated: z.boolean().optional(),
+  max_daily_runs: maxDailyRunsSchema.optional(),
+  max_daily_cost_usd: maxDailyCostUsdSchema.optional(),
   system_prompt: z.string().default(""),
 });
 export type AgentSpec = z.infer<typeof agentSpecSchema>;
@@ -103,6 +116,8 @@ export function agentToSpec(a: AgentDefinition): AgentSpec {
   if (a.project !== undefined) spec.project = a.project;
   if (a.maxConcurrent !== undefined) spec.max_concurrent = a.maxConcurrent;
   if (a.isolated !== undefined) spec.isolated = a.isolated;
+  if (a.maxDailyRuns !== undefined) spec.max_daily_runs = a.maxDailyRuns;
+  if (a.maxDailyCostUsd !== undefined) spec.max_daily_cost_usd = a.maxDailyCostUsd;
   return spec;
 }
 
@@ -170,6 +185,38 @@ export function projectAgentDefinitionHash(projectPath: string, name: string): s
   } catch {
     return null;
   }
+}
+
+/**
+ * Short hash of what an agent run is made of (`runs.agent_hash`): the loaded spec (every field
+ * except where it was loaded from, keys sorted, so moving or reformatting the file keeps the hash)
+ * and, for a link, the content of `<project>/.claude/agents/<claude_agent>.md`, the persona that
+ * actually runs. Two runs with the same hash ran the same agent; an edit to either part changes it.
+ */
+export function agentDefinitionHash(agent: AgentDefinition, projectPath: string): string {
+  const { source: _source, sourcePath: _sourcePath, ...spec } = agent;
+  const h = createHash("sha256").update(stableJson(spec));
+  if (agent.claudeAgent) {
+    h.update("\0");
+    const file = path.join(projectPath, ".claude", "agents", `${agent.claudeAgent}.md`);
+    try {
+      h.update(readFileSync(file));
+    } catch {
+      h.update("(missing)");
+    }
+  }
+  return h.digest("hex").slice(0, 12);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 /**

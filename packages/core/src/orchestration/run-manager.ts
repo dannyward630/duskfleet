@@ -6,38 +6,58 @@
  */
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { listProjectAgents, projectAgentDefinitionHash } from "../config/agent-files.js";
+import { agentDefinitionHash, listProjectAgents, projectAgentDefinitionHash } from "../config/agent-files.js";
 import { loadConfig } from "../config/loader.js";
 import type { AgentDefinition, DuskFleetConfig, ProjectDefinition } from "../config/types.js";
 import { mergeSubagent, needsRepair, sameSubagent, subagentsFromLog } from "../execution/log-replay.js";
-import type {
-  ExecutionEvent,
-  ExecutionHandle,
-  ExecutionRequest,
-  ExecutionResult,
-  Executor,
-  McpServerInfo,
-  SubagentRecord,
-  TokenUsage,
+import { allowListedMcpPrefixes, mcpToolPrefix } from "../execution/mcp.js";
+import { mergeUsageByModel } from "../execution/stream-json.js";
+import {
+  type ExecutionEvent,
+  type ExecutionHandle,
+  type ExecutionRequest,
+  type ExecutionResult,
+  type Executor,
+  type McpServerInfo,
+  MIXED_MODEL,
+  type SubagentRecord,
+  type TokenUsage,
+  type UsageByModel,
 } from "../execution/types.js";
+import { captureRunDiff, headSha } from "../git/diff.js";
 import {
   isBudgetExhausted,
   isResumable,
   isTerminal,
+  LAST_EVENT_WRITE_MS,
   orphanedError,
   type Run,
   type RunAgent,
+  type RunKind,
   type RunPhase,
   type RunStatus,
   type RunSummary,
   reviewReasons,
 } from "../observability/run.js";
-import { parseHolder, processIdentity } from "../scheduler/crud.js";
-import type { ListRunsFilter, RunRepository } from "../storage/runs.js";
+import { parseHolder, processIdentity, scheduleProjectId } from "../scheduler/crud.js";
+import type { ListRunsFilter, RunPatch, RunRepository } from "../storage/runs.js";
 import { logger } from "../util/log.js";
+import {
+  type Budget,
+  BudgetError,
+  type BudgetInput,
+  type BudgetStatus,
+  budgetLabel,
+  budgetRefusal,
+  budgetStatuses,
+  budgetStatusOf,
+  validateBudgetInput,
+} from "./budget.js";
+import { BusyError } from "./busy.js";
+import { DailyCapError, dailyCapReason, utcDayStart } from "./daily-cap.js";
 import { validateProjectPath } from "./project-validation.js";
 import { assertTransition } from "./run-state.js";
-import { summarizeToolInput } from "./tool-summary.js";
+import { allowListedMcpMissing, summarizeToolInput } from "./tool-summary.js";
 
 const log = logger("orchestration");
 
@@ -51,6 +71,10 @@ export interface StartRunInput {
   scheduleId?: string;
   /** Internal: continue the session of an earlier run instead of starting a new one (see resumeRun). */
   resume?: { fromRun: Run; budgetUsd: number };
+  /** `gate` for a schedule's gate agent (no wrap-up reserve, cost counted apart). Default `run`. */
+  kind?: RunKind;
+  /** Overrides the agent's max_budget_usd (gate runs). */
+  maxBudgetUsd?: number;
 }
 
 export interface ResumeRunInput {
@@ -99,6 +123,10 @@ interface ActiveRun {
   cancelRequested: boolean;
   /** When the main pass was launched; the wrap-up pass only gets what is left of the run's timeout. */
   startedAtMs: number;
+  /** HEAD of the project before the spawn; null when it is not a git checkout (no diff event then). */
+  gitBase: string | null;
+  /** When `last_event_at` was last written (0 = never); throttled to LAST_EVENT_WRITE_MS. */
+  lastEventWriteMs: number;
 }
 
 /** What the wrap-up pass is told. It must not start new work; it must leave a trace of where the run stopped. */
@@ -147,11 +175,6 @@ function summarizeSubagent(s: SubagentRecord) {
 /** A path separator, a leading ~ or a drive letter: anything else given as a project path is a project id. */
 function looksLikePath(value: string): boolean {
   return /[\\/]/.test(value) || value.startsWith("~") || /^[A-Za-z]:/.test(value);
-}
-
-/** Claude Code derives MCP tool prefixes from the server name: "claude.ai Figma" → "mcp__claude_ai_Figma". */
-export function mcpToolPrefix(serverName: string): string {
-  return "mcp__" + serverName.replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
 export class RunManager {
@@ -282,6 +305,11 @@ export class RunManager {
     return this.runs.events(runId);
   }
 
+  /** What the run changed in its git checkout (the `diff` event), or null. A pure read. */
+  diff(runId: string) {
+    return this.runs.diff(runId);
+  }
+
   /** Subagent invocations recorded for a run (see RunAgent). A pure read. */
   agents(runId: string): RunAgent[] {
     return this.runs.agents(runId);
@@ -348,54 +376,16 @@ export class RunManager {
    */
   async startRun(input: StartRunInput): Promise<Run> {
     this.reloadConfig();
-    const agent = this.resolveAgent(input.agentId);
-    // An agent bound to a project runs there by default and nowhere else.
-    const effectiveInput: StartRunInput =
-      agent.project && !input.projectId && !input.projectPath ? { ...input, projectId: agent.project } : input;
-    const { projectPath, projectId, project } = this.resolveProject(effectiveInput);
-    if (agent.project && projectId !== agent.project) {
-      throw new Error(
-        `agent "${agent.id}" belongs to project "${agent.project}" and cannot run on ${projectId ? `"${projectId}"` : projectPath}. ` +
-          `Omit the project to use the agent's own, or pick an agent without a project binding.`,
-      );
-    }
+    const { agent, projectPath, projectId, project } = this.resolveTarget(input);
     const prompt = input.prompt?.trim();
     if (!prompt) throw new Error("prompt is empty");
 
-    if (this.active.size >= this.config.maxConcurrentRuns) {
-      throw new Error(`max_concurrent_runs (${this.config.maxConcurrentRuns}) reached; wait for a run to finish`);
-    }
-    // Count this process's runs plus the live runs of other DuskFleet processes on the same database.
-    const busy: Array<[string, { projectPath: string; agentId: string; isolated: boolean }]> = [
-      ...this.active.entries(),
-    ];
-    for (const r of this.runs.listByStatus("running")) {
-      if (!this.active.has(r.id) && !this.ownerIsGone(r)) {
-        busy.push([r.id, { ...r, isolated: this.config.agents.get(r.agentId)?.isolated === true }]);
-      }
-    }
-    // Isolated agents never edit the checkout: they neither count against nor wait for the
-    // per-project limit. Only non-isolated runs compete for a working copy.
-    if (!agent.isolated) {
-      const sameProject = busy.filter(([, a]) => a.projectPath === projectPath && !a.isolated);
-      if (sameProject.length >= this.config.maxConcurrentPerProject) {
-        const [id, a] = sameProject[0]!;
-        throw new Error(
-          `project busy: run ${id} (agent ${a.agentId}) is still running in ${projectPath}. ` +
-            `max_concurrent_per_project is ${this.config.maxConcurrentPerProject}; wait, cancel_run, or raise it ` +
-            `(an agent that never edits the checkout can set isolated: true).`,
-        );
-      }
-    }
-    const agentLimit = agent.maxConcurrent ?? this.config.maxConcurrentPerAgent;
-    const sameAgent = busy.filter(([, a]) => a.agentId === agent.id).map(([id]) => id);
-    if (sameAgent.length >= agentLimit) {
-      const limitSource = agent.maxConcurrent !== undefined ? "its max_concurrent" : "max_concurrent_per_agent";
-      throw new Error(
-        `agent busy: agent ${agent.id} already has ${sameAgent.length} of ${agentLimit} runs (${sameAgent.join(", ")}). ` +
-          `${limitSource} is ${agentLimit}; wait, cancel_run, or raise it.`,
-      );
-    }
+    const busy = this.capacityError(agent, projectPath);
+    if (busy) throw new BusyError(busy);
+    const capped = this.dailyCapError(agent);
+    if (capped) throw new DailyCapError(capped);
+    const overBudget = this.budgetError(agent, projectId, projectPath);
+    if (overBudget) throw new BudgetError(overBudget);
 
     const runId = randomUUID();
     const resume = input.resume ?? null;
@@ -403,7 +393,14 @@ export class RunManager {
     const sessionId = resume?.fromRun.claudeSessionId ?? randomUUID();
     const model = input.model ?? agent.model;
     const timeoutMinutes = agent.timeoutMinutes ?? this.config.claude.defaultTimeoutMinutes;
-    const budget = budgetPlan(resume ? { ...agent, maxBudgetUsd: resume.budgetUsd } : agent, this.config);
+    const kind: RunKind = input.kind ?? "run";
+    const budgetAgent = resume
+      ? { ...agent, maxBudgetUsd: resume.budgetUsd }
+      : input.maxBudgetUsd !== undefined
+        ? { ...agent, maxBudgetUsd: input.maxBudgetUsd }
+        : agent;
+    // A gate is a quick yes/no: no reserve, no wrap-up pass.
+    const budget = budgetPlan(kind === "gate" ? { ...budgetAgent, wrapUpReserveUsd: 0 } : budgetAgent, this.config);
     const logPath = path.join(this.config.dataDir, "logs", `${runId}.jsonl`);
 
     const request: ExecutionRequest = {
@@ -421,7 +418,12 @@ export class RunManager {
     if (agent.disallowedTools) request.disallowedTools = agent.disallowedTools;
     if (agent.effort) request.effort = agent.effort;
     if (agent.systemPrompt) request.appendSystemPrompt = agent.systemPrompt;
-    if (agent.inheritMcp || project?.inheritMcp) request.inheritMcp = true;
+    if (agent.inheritMcp || project?.inheritMcp) {
+      request.inheritMcp = true;
+      // Connectors load at start or not at all: a child whose init lacks one is restarted once.
+      const required = allowListedMcpPrefixes(agent.allowedTools ?? []);
+      if (required.length) request.requiredMcpServers = required;
+    }
     if (agent.claudeAgent) {
       // Only project-level agents load under --setting-sources project,local; fail early with the real list.
       const available = listProjectAgents(projectPath).map((a) => a.name);
@@ -462,12 +464,16 @@ export class RunManager {
       outputTokens: null,
       cacheReadTokens: null,
       cacheCreationTokens: null,
+      usageByModel: null,
       costUsd: null,
       permissionDenials: null,
       deniedTools: [],
       mcp: { mounted: [], used: [], allowListedMissing: [] },
       humanIntervention: false,
       contextExhausted: false,
+      errorCode: null,
+      errorFamily: null,
+      errorDetail: null,
       retries: resume ? resume.fromRun.retries + 1 : 0,
       logPath,
       rawResultJson: null,
@@ -476,6 +482,11 @@ export class RunManager {
       phases: [],
       reviewReasons: [],
       resumedFromRunId: resume?.fromRun.id ?? null,
+      kind,
+      billingType: null,
+      agentHash: agentDefinitionHash(agent, projectPath),
+      claudeCodeVersion: null,
+      lastEventAt: null,
     };
 
     // Insert first so that events emitted by the executor always find the row. For a resume the
@@ -500,6 +511,8 @@ export class RunManager {
       });
     }
 
+    // What the checkout looked like before the agent touched it; the diff event compares with it.
+    const gitBase = headSha(projectPath);
     let handle: ExecutionHandle;
     try {
       handle = this.executor.execute(request, (event) => this.onEvent(runId, event));
@@ -534,8 +547,14 @@ export class RunManager {
       mainResult: null,
       cancelRequested: false,
       startedAtMs: Date.now(),
+      gitBase,
+      lastEventWriteMs: 0,
     });
-    this.transition(run, "running", { startedAt: new Date().toISOString(), command: handle.command });
+    this.transition(run, "running", {
+      startedAt: new Date().toISOString(),
+      command: handle.command,
+      billingType: handle.billingType ?? null,
+    });
     log.info("run started", {
       runId,
       agent: agent.id,
@@ -654,7 +673,180 @@ export class RunManager {
     }
   }
 
+  /**
+   * Why a run of this agent on this project would be refused right now (the WIP guards), or
+   * null. Lets the scheduler skip a busy tick before it spends anything on a gate.
+   */
+  busyReason(input: { agentId: string; projectId?: string | null }): string | null {
+    this.reloadConfig();
+    const target: StartRunInput = { prompt: "", agentId: input.agentId };
+    if (input.projectId) target.projectId = input.projectId;
+    // Same resolution as startRun; an invalid target throws here rather than passing silently.
+    const { agent, projectPath } = this.resolveTarget(target);
+    return this.capacityError(agent, projectPath);
+  }
+
+  /**
+   * Why a run of this agent would be refused by its daily caps right now, or null. Lets the
+   * scheduler skip a capped tick before it spends anything on a gate.
+   */
+  dailyCapReason(agentId: string): string | null {
+    this.reloadConfig();
+    return this.dailyCapError(this.resolveAgent(agentId));
+  }
+
+  /**
+   * Why a run of this agent (on this project) would be refused by a hard-stop budget right now,
+   * or null. Lets the scheduler skip a tick before it spends anything on a gate. Like startRun,
+   * a refusal pauses the schedules of the spent scope.
+   */
+  budgetReason(input: { agentId: string; projectId?: string | null }): string | null {
+    this.reloadConfig();
+    const target: StartRunInput = { prompt: "", agentId: input.agentId };
+    if (input.projectId) target.projectId = input.projectId;
+    const { agent, projectId, projectPath } = this.resolveTarget(target);
+    return this.budgetError(agent, projectId, projectPath);
+  }
+
+  /** Every budget with this month's spend and its state (ok / warn / over). A pure read. */
+  budgetStatuses(now: Date = new Date()): BudgetStatus[] {
+    return budgetStatuses(this.runs.budgets, this.config, now);
+  }
+
+  /** Create the budget of a scope or replace the one it has (validated first: unknown agent / project, amount, warn_percent). */
+  setBudget(input: BudgetInput): BudgetStatus {
+    this.reloadConfig();
+    const budget = this.runs.budgets.upsert(validateBudgetInput(this.config, input));
+    log.info("budget set", { scope: budgetLabel(budget), amountUsd: budget.amountUsd, hardStop: budget.hardStop });
+    return budgetStatusOf(this.runs.budgets, this.config, budget);
+  }
+
+  /** Delete a budget by id. Schedules it paused stay paused: resume them by hand. */
+  deleteBudget(id: string): boolean {
+    return this.runs.budgets.delete(id);
+  }
+
+  /**
+   * The project directory a run of this agent would use, resolved exactly as startRun does
+   * (schedule gates run their command there).
+   */
+  projectPathFor(input: { agentId: string; projectId?: string | null }): string {
+    this.reloadConfig();
+    const target: StartRunInput = { prompt: "", agentId: input.agentId };
+    if (input.projectId) target.projectId = input.projectId;
+    return this.resolveTarget(target).projectPath;
+  }
+
   // ---- internals -----------------------------------------------------------
+
+  /** Agent and project of a run: an agent bound to a project runs there by default and nowhere else. */
+  private resolveTarget(input: StartRunInput): {
+    agent: AgentDefinition;
+    projectPath: string;
+    projectId: string | null;
+    project: ProjectDefinition | null;
+  } {
+    const agent = this.resolveAgent(input.agentId);
+    const effectiveInput: StartRunInput =
+      agent.project && !input.projectId && !input.projectPath ? { ...input, projectId: agent.project } : input;
+    const { projectPath, projectId, project } = this.resolveProject(effectiveInput);
+    if (agent.project && projectId !== agent.project) {
+      throw new Error(
+        `agent "${agent.id}" belongs to project "${agent.project}" and cannot run on ${projectId ? `"${projectId}"` : projectPath}. ` +
+          `Omit the project to use the agent's own, or pick an agent without a project binding.`,
+      );
+    }
+    return { agent, projectPath, projectId, project };
+  }
+
+  /** The WIP guards: why a run of `agent` in `projectPath` is refused right now, or null. */
+  private capacityError(agent: AgentDefinition, projectPath: string): string | null {
+    if (this.active.size >= this.config.maxConcurrentRuns) {
+      return `max_concurrent_runs (${this.config.maxConcurrentRuns}) reached; wait for a run to finish`;
+    }
+    // Count this process's runs plus the live runs of other DuskFleet processes on the same database.
+    const busy: Array<[string, { projectPath: string; agentId: string; isolated: boolean }]> = [
+      ...this.active.entries(),
+    ];
+    for (const r of this.runs.listByStatus("running")) {
+      if (!this.active.has(r.id) && !this.ownerIsGone(r)) {
+        busy.push([r.id, { ...r, isolated: this.config.agents.get(r.agentId)?.isolated === true }]);
+      }
+    }
+    // Isolated agents never edit the checkout: they neither count against nor wait for the
+    // per-project limit. Only non-isolated runs compete for a working copy.
+    if (!agent.isolated) {
+      const sameProject = busy.filter(([, a]) => a.projectPath === projectPath && !a.isolated);
+      if (sameProject.length >= this.config.maxConcurrentPerProject) {
+        const [id, a] = sameProject[0]!;
+        return (
+          `project busy: run ${id} (agent ${a.agentId}) is still running in ${projectPath}. ` +
+          `max_concurrent_per_project is ${this.config.maxConcurrentPerProject}; wait, cancel_run, or raise it ` +
+          `(an agent that never edits the checkout can set isolated: true).`
+        );
+      }
+    }
+    const agentLimit = agent.maxConcurrent ?? this.config.maxConcurrentPerAgent;
+    const sameAgent = busy.filter(([, a]) => a.agentId === agent.id).map(([id]) => id);
+    if (sameAgent.length >= agentLimit) {
+      const limitSource = agent.maxConcurrent !== undefined ? "its max_concurrent" : "max_concurrent_per_agent";
+      return (
+        `agent busy: agent ${agent.id} already has ${sameAgent.length} of ${agentLimit} runs (${sameAgent.join(", ")}). ` +
+        `${limitSource} is ${agentLimit}; wait, cancel_run, or raise it.`
+      );
+    }
+    return null;
+  }
+
+  /** The daily caps (max_daily_runs, max_daily_cost_usd, UTC day): why one more run is refused, or null. */
+  private dailyCapError(agent: AgentDefinition): string | null {
+    if (agent.maxDailyRuns === undefined && agent.maxDailyCostUsd === undefined) return null;
+    return dailyCapReason(agent, this.runs.agentUsageSince(agent.id, utcDayStart(new Date())));
+  }
+
+  /**
+   * The budgets that cover a run of `agent` on this project (global, the agent's, the
+   * project's): why one more run is refused (the first spent hard-stop budget), or null. A
+   * refusal pauses every enabled schedule of that scope; a budget past warn_percent is logged.
+   */
+  private budgetError(agent: AgentDefinition, projectId: string | null, projectPath: string): string | null {
+    const budgets = this.runs.budgets.list();
+    if (!budgets.length) return null;
+    const now = new Date();
+    for (const b of budgets) {
+      const covers =
+        b.scope === "global" ||
+        (b.scope === "agent" && b.scopeId === agent.id) ||
+        (b.scope === "project" &&
+          (b.scopeId === projectId || this.config.projects.get(b.scopeId ?? "")?.path === projectPath));
+      if (!covers) continue;
+      const status = budgetStatusOf(this.runs.budgets, this.config, b, now);
+      if (status.state === "over" && b.hardStop) {
+        const paused = this.pauseSchedulesOf(b);
+        log.warn("budget spent; run refused", { budget: budgetLabel(b), spentUsd: status.spentUsd, paused });
+        return budgetRefusal(status, paused, now);
+      }
+      if (status.state !== "ok") {
+        log.warn("budget past its warn threshold", {
+          budget: budgetLabel(b),
+          percent: status.percent,
+          hardStop: b.hardStop,
+        });
+      }
+    }
+    return null;
+  }
+
+  /** Pause the enabled schedules a budget covers; returns their names. */
+  private pauseSchedulesOf(b: Budget): string[] {
+    const hit = this.runs.budgets.enabledSchedules().filter((s) => {
+      if (b.scope === "global") return true;
+      if (b.scope === "agent") return s.agentId === b.scopeId;
+      return scheduleProjectId(s, this.config.agents.get(s.agentId)) === b.scopeId;
+    });
+    this.runs.budgets.pauseSchedules(hit.map((s) => s.id));
+    return hit.map((s) => s.name);
+  }
 
   /**
    * A process of the run ended. The main pass that ran out of budget is followed by one
@@ -777,6 +969,7 @@ export class RunManager {
         });
         return;
       }
+      if (active?.gitBase) this.recordDiff(runId, active.projectPath, active.gitBase);
       this.transition(current, result.outcome, {
         endedAt: result.endedAt,
         durationMs: result.durationMs,
@@ -792,12 +985,16 @@ export class RunManager {
         outputTokens: result.usage.outputTokens,
         cacheReadTokens: result.usage.cacheReadTokens,
         cacheCreationTokens: result.usage.cacheCreationTokens,
+        usageByModel: result.usageByModel,
         costUsd: result.costUsd,
         permissionDenials: result.permissionDenials,
         deniedTools: result.deniedTools,
         mcp,
         humanIntervention: result.permissionDenials > 0,
         contextExhausted: result.contextExhausted,
+        errorCode: result.failure?.code ?? null,
+        errorFamily: result.failure?.family ?? null,
+        errorDetail: result.failure?.detail ?? null,
         rawResultJson: result.rawResult === null ? null : JSON.stringify(result.rawResult),
         phases,
       });
@@ -814,6 +1011,23 @@ export class RunManager {
   }
 
   /**
+   * The `diff` event: what the run changed since `base`, the patch next to the JSONL log.
+   * Written before the final status so a reader that sees the run ended also sees its diff.
+   * A git failure is a note, never a reason to lose the run's result.
+   */
+  private recordDiff(runId: string, projectPath: string, base: string): void {
+    try {
+      const diff = captureRunDiff(projectPath, base, path.join(this.config.dataDir, "logs", `${runId}.diff`));
+      if (diff) this.runs.addEvent(runId, "diff", diff);
+      else this.runs.addEvent(runId, "note", { message: "git diff of the run could not be read" });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.warn("diff capture failed", { runId, err: message });
+      this.runs.addEvent(runId, "note", { message: `git diff of the run could not be recorded: ${message}` });
+    }
+  }
+
+  /**
    * What MCP looked like in this run. "Missing" = an allow-listed mcp__ entry whose
    * server prefix matches neither a mounted server nor a server actually called.
    * Mounted lists can be empty while connectors are still connecting at init, so a
@@ -822,20 +1036,11 @@ export class RunManager {
   private summarizeMcp(active: ActiveRun | undefined): import("../execution/types.js").RunMcpInfo {
     if (!active) return { mounted: [], used: [], allowListedMissing: [] };
     const used = [...active.usedServers].sort();
-    const mountedPrefixes = new Set(active.mounted.map((m) => mcpToolPrefix(m.name)));
-    const evidence = mountedPrefixes.size > 0 || used.length > 0;
-    const allowListedPrefixes = new Set(
-      active.allowedTools
-        .filter((t) => t.startsWith("mcp__"))
-        .map((t) => {
-          const m = /^(mcp__[^_].*?)(?:__|$)/.exec(t);
-          return m ? m[1]! : t;
-        }),
-    );
-    const allowListedMissing = evidence
-      ? [...allowListedPrefixes].filter((p) => !mountedPrefixes.has(p) && !used.includes(p)).sort()
-      : [];
-    return { mounted: active.mounted, used, allowListedMissing };
+    return {
+      mounted: active.mounted,
+      used,
+      allowListedMissing: allowListedMcpMissing(active.allowedTools, active.mounted, used),
+    };
   }
 
   private resolveAgent(agentId: string | undefined): AgentDefinition {
@@ -895,13 +1100,23 @@ export class RunManager {
     run.status = to;
   }
 
+  /** Any output counts as a sign of life for the silent-run badge (`Run.lastEventAt`). */
+  private touchLastEvent(runId: string): void {
+    const a = this.active.get(runId);
+    const now = Date.now();
+    if (a && now - a.lastEventWriteMs < LAST_EVENT_WRITE_MS) return;
+    if (a) a.lastEventWriteMs = now;
+    this.runs.update(runId, { lastEventAt: new Date(now).toISOString() });
+  }
+
   private onEvent(runId: string, event: ExecutionEvent): void {
+    this.touchLastEvent(runId);
     switch (event.type) {
       case "init": {
-        this.runs.update(
-          runId,
-          event.sessionId ? { claudeSessionId: event.sessionId, modelUsed: event.model } : { modelUsed: event.model },
-        );
+        const patch: RunPatch = { modelUsed: event.model };
+        if (event.sessionId) patch.claudeSessionId = event.sessionId;
+        if (event.cliVersion) patch.claudeCodeVersion = event.cliVersion;
+        this.runs.update(runId, patch);
         const a = this.active.get(runId);
         if (a) a.mounted = event.mcpServers;
         this.runs.addEvent(runId, "init", {
@@ -940,6 +1155,18 @@ export class RunManager {
       case "parse_error":
         this.runs.addEvent(runId, "error", { parseError: event.line });
         break;
+      case "grace_kill":
+        this.runs.addEvent(runId, "note", {
+          message: `${event.childAlive ? "process" : "a descendant of the process"} still running ${event.afterMs / 1000} s after the result line: SIGTERM sent to its process group`,
+          graceKill: { pid: event.pid, afterMs: event.afterMs, childAlive: event.childAlive },
+        });
+        break;
+      case "mcp_restart":
+        this.runs.addEvent(runId, "note", {
+          message: `init reported no server for ${event.missing.join(", ")} (mounted: ${event.mounted.join(", ") || "none"}): process restarted once with a new session (pid ${event.pid ?? "?"})`,
+          mcpRestart: { missing: event.missing, mounted: event.mounted, pid: event.pid, sessionId: event.sessionId },
+        });
+        break;
       default:
         break; // assistant_text and stderr go to the log file only
     }
@@ -976,6 +1203,18 @@ function defined<T extends object>(patch: T): Partial<T> {
   return Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) as Partial<T>;
 }
 
+/**
+ * One pass's per-model usage, so the merged map always sums to the merged totals: the
+ * pass's own map when it has one, nothing when it spent no tokens, its totals under its
+ * model when that model is known, otherwise "unknown" (undefined).
+ */
+function passUsageByModel(r: ExecutionResult): UsageByModel | null | undefined {
+  if (r.usageByModel) return r.usageByModel;
+  if (Object.values(r.usage).every((v) => v === null)) return null;
+  if (r.model && r.model !== MIXED_MODEL) return { [r.model]: r.usage };
+  return undefined;
+}
+
 export function mergeResults(main: ExecutionResult, wrapUp: ExecutionResult): ExecutionResult {
   const usage: TokenUsage = {
     inputTokens: addNullable(main.usage.inputTokens, wrapUp.usage.inputTokens),
@@ -983,20 +1222,29 @@ export function mergeResults(main: ExecutionResult, wrapUp: ExecutionResult): Ex
     cacheReadTokens: addNullable(main.usage.cacheReadTokens, wrapUp.usage.cacheReadTokens),
     cacheCreationTokens: addNullable(main.usage.cacheCreationTokens, wrapUp.usage.cacheCreationTokens),
   };
+  // A pass whose tokens cannot be attributed to a model drops the map: a partial map
+  // would no longer sum to the totals above.
+  const mainByModel = passUsageByModel(main);
+  const wrapUpByModel = passUsageByModel(wrapUp);
+  const usageByModel =
+    mainByModel === undefined || wrapUpByModel === undefined ? null : mergeUsageByModel(mainByModel, wrapUpByModel);
   return {
     ...main,
     outcome: wrapUp.outcome === "cancelled" ? "cancelled" : main.outcome,
-    model: main.model ?? wrapUp.model,
+    model: usageByModel && Object.keys(usageByModel).length > 1 ? MIXED_MODEL : (main.model ?? wrapUp.model),
     endedAt: wrapUp.endedAt,
     durationMs: Math.max(0, Date.parse(wrapUp.endedAt) - Date.parse(main.startedAt)),
     resultText: wrapUp.resultText ?? main.resultText,
     numTurns: addNullable(main.numTurns, wrapUp.numTurns),
     toolCalls: main.toolCalls + wrapUp.toolCalls,
     usage,
+    usageByModel,
     costUsd: addNullable(main.costUsd, wrapUp.costUsd),
     permissionDenials: main.permissionDenials + wrapUp.permissionDenials,
     deniedTools: [...main.deniedTools, ...wrapUp.deniedTools],
     contextExhausted: main.contextExhausted || wrapUp.contextExhausted,
+    // A run cancelled during its wrap-up is stored as cancelled: no failure code, as for any cancel.
+    failure: wrapUp.outcome === "cancelled" ? null : (main.failure ?? wrapUp.failure),
     subagents: [...main.subagents, ...wrapUp.subagents],
   };
 }

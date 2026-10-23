@@ -3,26 +3,40 @@
  * (kill switch), fire every due schedule through RunManager, advance next_run_at.
  *
  * Policies, deliberately simple:
- *  - No catch-up. A schedule that was due while nobody was running is not fired
- *    late; its next_run_at is recomputed from now. Hourly jobs do not want a burst.
- *  - Busy is a skip, never a queue. RunManager's per-agent / per-project guards
- *    throw; the firing is recorded as `skipped_busy`.
+ *  - No catch-up (`catch_up_policy: skip_missed`, the only implemented value). Ticks
+ *    missed while nobody was running are not replayed: the schedule fires once when
+ *    next considered and its next_run_at is recomputed from now. Hourly jobs do not want a burst.
+ *  - Busy is a skip, never a queue (`concurrency_policy: skip_if_active`, the only value).
+ *    RunManager's per-agent / per-project guards throw; the firing is recorded as `skipped_busy`.
+ *  - An agent over its daily cap (max_daily_runs / max_daily_cost_usd, UTC day) is a
+ *    skip too, recorded as `skipped_daily_cap`.
+ *  - A spent hard-stop budget (global / agent / project, UTC month) is `skipped_budget`; the
+ *    refusal pauses every schedule of that scope (RunManager), so they stay off until resumed.
  *  - Only one process ticks: the SQLite lease (see ScheduleRepository) is renewed
  *    every tick and expires after 3 ticks without renewal. The `serve` role takes
  *    it from any other holder (`mcp`, `cli`, role-less) on its first tick: the
  *    installed service runs the latest build, an MCP server a host keeps alive
  *    may not, and it must never hold the lease for days.
+ *  - The lease decides who ticks; a compare-and-set on next_run_at (claimDue) decides who
+ *    fires a due tick, so a lease handover in the middle of a tick cannot fire it twice.
  *  - A process without a RunManager (the dashboard) triggers a schedule by setting
  *    `run_requested_at`; the lease holder fires it on its next tick, paused or not.
+ *  - Auto-pause: before a scheduled (not manual) fire, a schedule whose last
+ *    `scheduler.auto_pause_after` ended runs were all empty (0 tool calls) or needs review
+ *    is paused instead, with the reason stored on the row (`auto_paused` firing).
  *  - The lease holder also sweeps orphaned runs (owner process gone) at most once a
  *    minute, so a crashed process's runs close without waiting for the next start.
  */
 
 import type { Run } from "../observability/run.js";
+import { BudgetError } from "../orchestration/budget.js";
+import { BusyError } from "../orchestration/busy.js";
+import { DailyCapError } from "../orchestration/daily-cap.js";
 import type { RunManager } from "../orchestration/run-manager.js";
 import type { ScheduleRepository } from "../storage/schedules.js";
 import { logger } from "../util/log.js";
 import {
+  autoPauseReason,
   createSchedule,
   nextRunAtFor,
   parseHolder,
@@ -32,15 +46,23 @@ import {
   scheduleRunState,
   updateSchedule,
 } from "./crud.js";
+import { evaluateGate } from "./gate.js";
+import { type IdleStats, scheduleIdleStats } from "./idle.js";
 import type { Schedule, ScheduleInput, ScheduleOutcome, SchedulePatch } from "./types.js";
+
+export interface FireResult {
+  outcome: ScheduleOutcome;
+  runId: string | null;
+  /** Error, busy message, or the gate's reason for a skip. */
+  error: string | null;
+  /** Set when an agent gate ran on this fire. */
+  gateRunId?: string | null;
+  gateCostUsd?: number | null;
+}
 
 const log = logger("scheduler");
 
 const ORPHAN_SWEEP_MS = 60_000;
-/** RunManager's refusals that make a tick skip (keep "agent busy" / "project busy" in its error text). */
-function isBusy(message: string): boolean {
-  return /\b(project busy|agent busy|max_concurrent_runs)\b/.test(message);
-}
 
 export interface SchedulerOptions {
   tickMs?: number;
@@ -70,6 +92,10 @@ export class Scheduler {
   private leaseHeld = false;
   private ticking = false;
   private lastSweepMs = -Infinity;
+  /** Schedules whose gate is being evaluated right now (at most one gate per schedule). */
+  private readonly gating = new Set<string>();
+  /** Gated fires started by a tick that run on in the background (see dispatch). */
+  private readonly background = new Set<Promise<FireResult>>();
   /** `serve` takes the lease from `mcp` / `cli` / role-less holders instead of waiting for it to expire. */
   private readonly preempts: boolean;
 
@@ -112,15 +138,22 @@ export class Scheduler {
     return this.repo.list();
   }
 
-  /** Schedules with the state of the run each last started and what their next fire does (see scheduleRunState). */
-  listWithLastRun(): Array<Schedule & ScheduleRunState> {
-    return this.repo.list().map((s) => this.withLastRun(s));
+  /** Schedules with the state of the run each last started, what their next fire does (see scheduleRunState) and their 7-day idle cost. */
+  listWithLastRun(): Array<Schedule & ScheduleRunState & { idle7d: IdleStats }> {
+    const now = this.now();
+    return this.repo.list().map((s) => this.withLastRun(s, now));
   }
 
-  /** One schedule with its run state: lastRun, effectiveOnFailure, onFailureSource, willResumeRunId. */
-  withLastRun(s: Schedule): Schedule & ScheduleRunState {
-    const { lastRun, effectiveOnFailure, onFailureSource, willResumeRunId } = this.runState(s);
-    return { ...s, lastRun, effectiveOnFailure, onFailureSource, willResumeRunId };
+  /** One schedule with its run state (lastRun, effectiveOnFailure, onFailureSource, willResumeRunId, effectiveProjectId) and idle7d. */
+  withLastRun(s: Schedule, now: Date = this.now()): Schedule & ScheduleRunState & { idle7d: IdleStats } {
+    const { lastRun, effectiveOnFailure, onFailureSource, willResumeRunId, effectiveProjectId } = this.runState(s);
+    const idle7d = scheduleIdleStats(this.repo, s, this.runs.config.scheduler.noopPattern, now);
+    return { ...s, lastRun, effectiveOnFailure, onFailureSource, willResumeRunId, effectiveProjectId, idle7d };
+  }
+
+  /** Idle stats of one schedule over the last `days`. */
+  idleStats(s: Schedule, days = 7): IdleStats {
+    return scheduleIdleStats(this.repo, s, this.runs.config.scheduler.noopPattern, this.now(), days);
   }
 
   get(id: string): Schedule | null {
@@ -131,11 +164,21 @@ export class Scheduler {
     return this.repo.firings(id, limit);
   }
 
+  /**
+   * Ask whichever process holds the lease to fire this schedule on its next tick (see
+   * `ScheduleRepository.requestRun`). Accepts the id or the unique name. Unlike `fireNow`
+   * it spawns nothing here, so a short-lived caller (CLI, git hook) can return at once.
+   */
+  requestRun(idOrName: string): Schedule | null {
+    const s = this.repo.get(idOrName) ?? this.repo.findByName(idOrName);
+    return s ? this.repo.requestRun(s.id) : null;
+  }
+
   /** Fire a schedule right now, outside its cron (manual trigger). Returns the outcome. */
-  async fireNow(id: string): Promise<{ outcome: ScheduleOutcome; runId: string | null; error: string | null }> {
+  async fireNow(id: string, options: { skipGate?: boolean } = {}): Promise<FireResult> {
     const s = this.repo.get(id);
     if (!s) throw new Error(`schedule not found: ${id}`);
-    return this.fire(s, true);
+    return this.fire(s, true, options.skipGate ?? false);
   }
 
   // ---- loop ----------------------------------------------------------------
@@ -202,10 +245,10 @@ export class Scheduler {
       // Manual "run now" requests (dashboard) first: they fire even when paused, like fireNow.
       for (const s of this.repo.takeRunRequests()) {
         log.info("run requested", { schedule: s.name, requestedAt: s.runRequestedAt });
-        await this.fire(s, true);
+        await this.dispatch(s, true);
       }
       for (const s of this.repo.due(this.now().toISOString())) {
-        await this.fire(s, false);
+        await this.dispatch(s, false);
       }
     } catch (err) {
       log.error("tick failed", { err: err instanceof Error ? err.message : String(err) });
@@ -214,17 +257,61 @@ export class Scheduler {
     }
   }
 
+  /** Resolves once the gated fires started by earlier ticks have finished (tests, shutdown). */
+  async settled(): Promise<void> {
+    await Promise.allSettled([...this.background]);
+  }
+
   // ---- internals -----------------------------------------------------------
 
-  private async fire(
-    s: Schedule,
-    manual: boolean,
-  ): Promise<{ outcome: ScheduleOutcome; runId: string | null; error: string | null }> {
+  /**
+   * Fire from a tick. A gated schedule fires in the background: its gate can take minutes
+   * (a command up to 600 s, an agent up to its timeout), and the tick must go on renewing the
+   * lease and serving other due schedules and run-now requests meanwhile. The fire claims its
+   * tick (next_run_at) before the gate starts, so no later tick, here or in another process
+   * that took the lease over, fires it again.
+   *
+   * A scheduled (non-manual) fire is claimed first with a compare-and-set on the next_run_at
+   * this tick read: if another process fired it meanwhile (the lease changed hands between
+   * `due()` and here), the claim fails and this tick leaves it alone, recording nothing.
+   */
+  private async dispatch(s: Schedule, manual: boolean): Promise<void> {
+    if (!manual) {
+      const next = s.enabled ? this.computeNext(s.cron, s.timeZone) : null;
+      if (!this.repo.claimDue(s.id, s.nextRunAt, next)) {
+        log.info("tick already claimed elsewhere; not firing", { schedule: s.name, nextRunAt: s.nextRunAt });
+        return;
+      }
+    }
+    if (!s.gate) {
+      await this.fire(s, manual);
+      return;
+    }
+    const p: Promise<FireResult> = this.fire(s, manual)
+      .catch((err): FireResult => {
+        const message = err instanceof Error ? err.message : String(err);
+        log.error("gated fire failed", { schedule: s.name, err: message });
+        return { outcome: "error", runId: null, error: message };
+      })
+      .finally(() => this.background.delete(p));
+    this.background.add(p);
+  }
+
+  private async fire(s: Schedule, manual: boolean, skipGate = false): Promise<FireResult> {
     const nextRunAt = s.enabled ? this.computeNext(s.cron, s.timeZone) : null;
     if (!s.enabled && !manual) {
       this.repo.recordFiring(s.id, "skipped_disabled", null, null, nextRunAt);
       return { outcome: "skipped_disabled", runId: null, error: null };
     }
+    if (!manual) {
+      const reason = autoPauseReason(this.repo, s, this.runs.config.scheduler.autoPauseAfter);
+      if (reason && this.repo.autoPause(s.id, reason, this.now().toISOString())) {
+        this.repo.recordFiring(s.id, "auto_paused", null, reason, null);
+        log.warn("schedule auto-paused", { schedule: s.name, reason });
+        return { outcome: "auto_paused", runId: null, error: reason };
+      }
+    }
+    let gateSpend: { runId: string | null; costUsd: number | null } | null = null;
     try {
       const resumable = this.resumeCandidate(s);
       let resumeError: string | null = null;
@@ -245,11 +332,54 @@ export class Scheduler {
           // Busy is a skip: the resume is tried again on the next tick. Anything else (agent
           // deleted, project gone, already resumed by another process) would come back on every
           // tick, so this fire starts fresh instead and last_run_id moves past the failed run.
+          // A daily cap is a skip too: starting fresh would hit the same cap.
+          if (err instanceof BusyError || err instanceof DailyCapError || err instanceof BudgetError) throw err;
           const message = err instanceof Error ? err.message : String(err);
-          if (isBusy(message)) throw err;
           resumeError = message;
           log.warn("resume refused; starting fresh", { schedule: s.name, resumedFrom: resumable.id, message });
         }
+      }
+      if (s.gate && !skipGate) {
+        if (this.gating.has(s.id))
+          throw new BusyError(`schedule "${s.name}" busy: its gate from an earlier fire is still running`);
+        // Busy first: a gate costs time (and, for an agent gate, money) only when the run could start.
+        const busy = this.runs.busyReason({ agentId: s.agentId, projectId: s.projectId });
+        if (busy) throw new BusyError(busy);
+        const capped = this.runs.dailyCapReason(s.agentId);
+        if (capped) throw new DailyCapError(capped);
+        const overBudget = this.runs.budgetReason({ agentId: s.agentId, projectId: s.projectId });
+        if (overBudget) throw new BudgetError(overBudget);
+        // Claim the tick before the gate runs: next_run_at moves on now, so neither a later tick
+        // nor another process that takes the lease during a long gate sees it as still due.
+        // A scheduled fire was already claimed by dispatch (claimDue); a manual one is claimed here.
+        if (manual) this.repo.claimTick(s.id, nextRunAt);
+        this.gating.add(s.id);
+        let verdict: Awaited<ReturnType<typeof evaluateGate>>;
+        try {
+          verdict = await evaluateGate(this.runs, s);
+        } finally {
+          this.gating.delete(s.id);
+        }
+        gateSpend = { runId: verdict.gateRunId, costUsd: verdict.costUsd };
+        if (verdict.kind === "skip") {
+          this.repo.recordFiring(s.id, "skipped_gate", null, verdict.reason, nextRunAt, gateSpend);
+          log.info("schedule skipped by its gate", {
+            schedule: s.name,
+            reason: verdict.reason.slice(0, 200),
+            gateCostUsd: verdict.costUsd,
+          });
+          return {
+            outcome: "skipped_gate",
+            runId: null,
+            error: verdict.reason,
+            gateRunId: verdict.gateRunId,
+            gateCostUsd: verdict.costUsd,
+          };
+        }
+        if (verdict.kind === "busy") throw new BusyError(verdict.reason);
+        if (verdict.kind === "daily_cap") throw new DailyCapError(verdict.reason);
+        if (verdict.kind === "budget") throw new BudgetError(verdict.reason);
+        if (verdict.kind === "error") throw new Error(`gate: ${verdict.reason}`);
       }
       const input: Parameters<RunManager["startRun"]>[0] = { prompt: s.prompt, agentId: s.agentId, scheduleId: s.id };
       if (s.projectId) input.projectId = s.projectId;
@@ -257,15 +387,29 @@ export class Scheduler {
       const run = await this.runs.startRun(input);
       if (resumable && resumeError)
         this.runs.note(run.id, `started fresh: the resume of run ${resumable.id} was refused (${resumeError})`);
-      this.repo.recordFiring(s.id, "started", run.id, null, nextRunAt);
-      log.info("schedule fired", { schedule: s.name, runId: run.id, manual });
-      return { outcome: "started", runId: run.id, error: null };
+      this.repo.recordFiring(s.id, "started", run.id, null, nextRunAt, gateSpend);
+      log.info("schedule fired", { schedule: s.name, runId: run.id, manual, gated: gateSpend !== null });
+      return {
+        outcome: "started",
+        runId: run.id,
+        error: null,
+        ...(gateSpend ? { gateRunId: gateSpend.runId, gateCostUsd: gateSpend.costUsd } : {}),
+      };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const busy = isBusy(message);
-      const outcome: ScheduleOutcome = busy ? "skipped_busy" : "error";
-      this.repo.recordFiring(s.id, outcome, null, message, nextRunAt);
-      (busy ? log.info : log.warn)("schedule not started", { schedule: s.name, outcome, message });
+      // Structured, never matched on the text: a gate's stderr may well say "project busy".
+      const outcome: ScheduleOutcome =
+        err instanceof BusyError
+          ? "skipped_busy"
+          : err instanceof DailyCapError
+            ? "skipped_daily_cap"
+            : err instanceof BudgetError
+              ? "skipped_budget"
+              : "error";
+      // A budget refusal has just paused the schedule: keep next_run_at cleared, as a pause does.
+      const next = outcome === "skipped_budget" && !this.repo.get(s.id)?.enabled ? null : nextRunAt;
+      this.repo.recordFiring(s.id, outcome, null, message, next, gateSpend);
+      (outcome === "error" ? log.warn : log.info)("schedule not started", { schedule: s.name, outcome, message });
       return { outcome, runId: null, error: message };
     }
   }

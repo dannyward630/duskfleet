@@ -198,6 +198,106 @@ const MIGRATIONS: ReadonlyArray<{ version: number; sql: string; backfill?: (db: 
       CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_resumed_from ON runs(resumed_from_run_id);
     `,
   },
+  {
+    // Idle cost: per-schedule no-op marker (null = scheduler.noop_pattern) and the indexes the
+    // 7-day stats read (runs by schedule and date, firings by schedule and date).
+    version: 11,
+    sql: `
+      ALTER TABLE schedules ADD COLUMN noop_pattern TEXT;
+      CREATE INDEX IF NOT EXISTS idx_runs_schedule_created ON runs(schedule_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_schedule_firings_time ON schedule_firings(schedule_id, fired_at);
+    `,
+  },
+  {
+    // Schedule gates: a cheap check (shell command or gate agent) before the real run. Gate
+    // agent runs are runs of kind 'gate', so their cost is counted apart from the real runs.
+    version: 12,
+    sql: `
+      ALTER TABLE schedules ADD COLUMN gate_json TEXT;
+      ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'run';
+      ALTER TABLE schedule_firings ADD COLUMN gate_run_id TEXT;
+      ALTER TABLE schedule_firings ADD COLUMN gate_cost_usd REAL;
+    `,
+  },
+  {
+    // Tokens per model from the result line's modelUsage (subagents can run on another model).
+    // NULL for older rows and for runs whose result carried no modelUsage.
+    version: 13,
+    sql: `ALTER TABLE runs ADD COLUMN usage_by_model_json TEXT;`,
+  },
+  {
+    // Who pays for cost_usd: 'api' (ANTHROPIC_API_KEY in the child's environment) or
+    // 'subscription'. Set when the run spawns; NULL for older rows (unknown, not guessed).
+    version: 14,
+    sql: `ALTER TABLE runs ADD COLUMN billing_type TEXT;`,
+  },
+  {
+    // Why a run failed, as a code (classifyFailure): error_code (auth_required, provider_quota, ...),
+    // its family (setup / limit / transient / refusal) and the detail some codes carry (login URL,
+    // retry_not_before) as JSON. NULL for older rows and for failures that match no code.
+    version: 15,
+    sql: `
+      ALTER TABLE runs ADD COLUMN error_code TEXT;
+      ALTER TABLE runs ADD COLUMN error_family TEXT;
+      ALTER TABLE runs ADD COLUMN error_detail_json TEXT;
+    `,
+  },
+  {
+    // Auto-pause: the scheduler pauses a schedule whose last scheduler.auto_pause_after runs were
+    // all empty (0 tool calls) or needs review, and says why. auto_paused_at stays after a resume
+    // so the runs before it do not count again.
+    version: 16,
+    sql: `
+      ALTER TABLE schedules ADD COLUMN paused_reason TEXT;
+      ALTER TABLE schedules ADD COLUMN auto_paused_at TEXT;
+    `,
+  },
+  {
+    // Schedule policies made explicit: what a busy tick does (concurrency_policy, only
+    // skip_if_active) and what happens to ticks missed while nobody ticked (catch_up_policy,
+    // skip_missed; enqueue_missed_with_cap is reserved). Existing rows get today's behaviour.
+    version: 17,
+    sql: `
+      ALTER TABLE schedules ADD COLUMN concurrency_policy TEXT NOT NULL DEFAULT 'skip_if_active';
+      ALTER TABLE schedules ADD COLUMN catch_up_policy TEXT NOT NULL DEFAULT 'skip_missed';
+    `,
+  },
+  {
+    // Monthly budgets per scope (global / agent / project), calendar month in UTC, compared with
+    // the recorded cost of the scope's runs. One per scope: scope_id is NULL for global, so the
+    // unique index is on COALESCE(scope_id, '').
+    version: 18,
+    sql: `
+      CREATE TABLE IF NOT EXISTS budgets (
+        id           TEXT PRIMARY KEY,
+        scope        TEXT NOT NULL CHECK (scope IN ('global', 'agent', 'project')),
+        scope_id     TEXT,
+        amount_usd   REAL NOT NULL CHECK (amount_usd > 0),
+        warn_percent INTEGER NOT NULL DEFAULT 80,
+        hard_stop    INTEGER NOT NULL DEFAULT 1,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_scope ON budgets(scope, COALESCE(scope_id, ''));
+    `,
+  },
+  {
+    // Eval bundle: what exactly ran, so runs compare like with like. agent_hash = agentDefinitionHash
+    // at start time (the agent spec, plus the project agent file of a link); claude_code_version from
+    // the init line. model_used was there from the start. NULL for older rows (unknown, not guessed).
+    version: 19,
+    sql: `
+      ALTER TABLE runs ADD COLUMN agent_hash TEXT;
+      ALTER TABLE runs ADD COLUMN claude_code_version TEXT;
+    `,
+  },
+  {
+    // When the run last produced output (any stream-json event), written by RunManager at most
+    // every LAST_EVENT_WRITE_MS. The dashboard shows "no output for N min" on silent running rows.
+    // NULL for older rows and for runs that never emitted an event.
+    version: 20,
+    sql: `ALTER TABLE runs ADD COLUMN last_event_at TEXT;`,
+  },
 ];
 
 /**

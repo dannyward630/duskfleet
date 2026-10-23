@@ -7,6 +7,7 @@ export {
   AGENT_ID_PATTERN,
   type AgentKind,
   type AgentSpec,
+  agentDefinitionHash,
   agentFilePath,
   agentKind,
   agentSpecSchema,
@@ -20,6 +21,7 @@ export {
   renderAgentMarkdown,
   writeAgentFile,
 } from "./config/agent-files.js";
+export { type AgentLintProblem, assertAgentSpecClean, collapseHome, lintAgentSpec } from "./config/agent-lint.js";
 export {
   expandHome,
   findRepoRoot,
@@ -38,8 +40,14 @@ export {
 } from "./config/project-files.js";
 export * from "./config/types.js";
 export * from "./evals/types.js";
-export { ClaudeCodeExecutor, type ClaudeCodeExecutorOptions, resolveClaudeBinary } from "./execution/claude-code.js";
+export {
+  billingTypeOf,
+  ClaudeCodeExecutor,
+  type ClaudeCodeExecutorOptions,
+  resolveClaudeBinary,
+} from "./execution/claude-code.js";
 export { mergeSubagent, needsRepair, sameSubagent, subagentsFromLog } from "./execution/log-replay.js";
+export { allowListedMcpPrefixes, mcpToolPrefix, missingMcpServers } from "./execution/mcp.js";
 export {
   cleanHandBack,
   createStreamState,
@@ -50,12 +58,44 @@ export {
   type StreamState,
 } from "./execution/stream-json.js";
 export * from "./execution/types.js";
+export {
+  captureRunDiff,
+  DIFF_MAX_COUNTED_BYTES,
+  DIFF_MAX_COUNTED_FILES,
+  DIFF_MAX_FILES,
+  DIFF_MAX_PATCH_BYTES,
+  DIFF_TIME_BUDGET_MS,
+  type DiffFile,
+  type DiffFileStatus,
+  headSha,
+  parseNameStatus,
+  parseNumstat,
+  type RunDiff,
+} from "./git/diff.js";
+export * from "./observability/failure.js";
 export * from "./observability/run.js";
+export {
+  BUDGET_SCOPES,
+  type Budget,
+  BudgetError,
+  type BudgetInput,
+  type BudgetScope,
+  type BudgetSource,
+  type BudgetState,
+  type BudgetStatus,
+  budgetLabel,
+  budgetStatus,
+  budgetStatuses,
+  budgetStatusOf,
+  DEFAULT_WARN_PERCENT,
+  utcMonthStart,
+  validateBudgetInput,
+} from "./orchestration/budget.js";
+export { BusyError } from "./orchestration/busy.js";
+export { DailyCapError } from "./orchestration/daily-cap.js";
 export { ProjectValidationError, validateProjectPath } from "./orchestration/project-validation.js";
-
 export {
   budgetPlan,
-  mcpToolPrefix,
   mergeResults,
   type ResumeRunInput,
   RunManager,
@@ -65,7 +105,7 @@ export {
   WRAP_UP_PROMPT,
 } from "./orchestration/run-manager.js";
 export { assertTransition, IllegalTransitionError } from "./orchestration/run-state.js";
-export { summarizeToolInput } from "./orchestration/tool-summary.js";
+export { allowListedMcpMissing, summarizeToolInput } from "./orchestration/tool-summary.js";
 export {
   assertTimeZone,
   CronError,
@@ -76,6 +116,7 @@ export {
   parseCron,
 } from "./scheduler/cron.js";
 export {
+  autoPauseReason,
   createSchedule,
   DEFAULT_TIME_ZONE,
   effectiveOnFailure,
@@ -85,16 +126,34 @@ export {
   processIdentity,
   type ScheduleRunState,
   type SchedulerRole,
+  scheduleProjectId,
   scheduleRunState,
   updateSchedule,
   validateScheduleInput,
   willResume,
 } from "./scheduler/crud.js";
+export {
+  evaluateGate,
+  type GateVerdict,
+  gateSaysNoWork,
+  runCommandGate,
+  validateGate,
+} from "./scheduler/gate.js";
+export {
+  computeIdleStats,
+  DEFAULT_NOOP_PATTERN,
+  type IdleStats,
+  isNoopRun,
+  NOOP_TEXT_LIMIT,
+  parseNoopPattern,
+  scheduleIdleStats,
+} from "./scheduler/idle.js";
 export { attachLastRun, type RunSummarySource, type ScheduleWithLastRun } from "./scheduler/last-run.js";
-export { Scheduler, type SchedulerOptions, type SchedulerStatus } from "./scheduler/scheduler.js";
+export { type FireResult, Scheduler, type SchedulerOptions, type SchedulerStatus } from "./scheduler/scheduler.js";
 export * from "./scheduler/types.js";
+export { BudgetRepository } from "./storage/budgets.js";
 export { migrationDigests, openDatabase } from "./storage/db.js";
 export { type ListRunsFilter, NEEDS_REVIEW_SQL, type RunPatch, RunRepository } from "./storage/runs.js";
-export { ScheduleRepository } from "./storage/schedules.js";
+export { type EndedRunFacts, parseGate, ScheduleRepository } from "./storage/schedules.js";
 
 export { type LogLevel, logger } from "./util/log.js";

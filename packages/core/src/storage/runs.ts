@@ -1,6 +1,18 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { DeniedTool, RunMcpInfo, SubagentRecord, SubagentStatus } from "../execution/types.js";
-import type { ReviewReason, Run, RunAgent, RunEvent, RunPhase, RunStatus, RunSummary } from "../observability/run.js";
+import type { DeniedTool, RunMcpInfo, SubagentRecord, SubagentStatus, UsageByModel } from "../execution/types.js";
+import type { RunDiff } from "../git/diff.js";
+import { FAILURE_CODES, FAILURE_FAMILY, type FailureCode, type FailureDetail } from "../observability/failure.js";
+import type {
+  ReviewReason,
+  Run,
+  RunAgent,
+  RunEvent,
+  RunKind,
+  RunPhase,
+  RunStatus,
+  RunSummary,
+} from "../observability/run.js";
+import { BudgetRepository } from "./budgets.js";
 
 /** Row shape as SQLite returns it. */
 interface RunRow {
@@ -29,6 +41,7 @@ interface RunRow {
   output_tokens: number | null;
   cache_read_tokens: number | null;
   cache_creation_tokens: number | null;
+  usage_by_model_json: string | null;
   cost_usd: number | null;
   permission_denials: number | null;
   denied_tools_json: string | null;
@@ -43,6 +56,14 @@ interface RunRow {
   phases_json: string | null;
   review_reasons_json: string | null;
   resumed_from_run_id: string | null;
+  kind: string | null;
+  billing_type: string | null;
+  error_code: string | null;
+  error_family: string | null;
+  error_detail_json: string | null;
+  agent_hash: string | null;
+  claude_code_version: string | null;
+  last_event_at: string | null;
 }
 
 function rowToRun(r: RunRow): Run {
@@ -72,12 +93,14 @@ function rowToRun(r: RunRow): Run {
     outputTokens: r.output_tokens,
     cacheReadTokens: r.cache_read_tokens,
     cacheCreationTokens: r.cache_creation_tokens,
+    usageByModel: parseUsageByModel(r.usage_by_model_json),
     costUsd: r.cost_usd,
     permissionDenials: r.permission_denials,
     deniedTools: safeParse(r.denied_tools_json),
     mcp: parseMcp(r.mcp_json),
     humanIntervention: r.human_intervention === 1,
     contextExhausted: r.context_exhausted === 1,
+    ...parseFailure(r),
     retries: r.retries,
     logPath: r.log_path,
     rawResultJson: r.raw_result_json,
@@ -86,6 +109,11 @@ function rowToRun(r: RunRow): Run {
     phases: parsePhases(r.phases_json),
     reviewReasons: parseReasons(r.review_reasons_json),
     resumedFromRunId: r.resumed_from_run_id ?? null,
+    kind: r.kind === "gate" ? "gate" : "run",
+    billingType: r.billing_type === "api" || r.billing_type === "subscription" ? r.billing_type : null,
+    agentHash: r.agent_hash ?? null,
+    claudeCodeVersion: r.claude_code_version ?? null,
+    lastEventAt: r.last_event_at ?? null,
   };
 }
 
@@ -97,6 +125,33 @@ function parseReasons(json: string | null | undefined): ReviewReason[] {
     return Array.isArray(v) ? v.filter((x): x is ReviewReason => typeof x === "string") : [];
   } catch {
     return [];
+  }
+}
+
+/** NULL for rows before migration 15 and for runs without a known failure; an unknown code reads as none. */
+function parseFailure(r: RunRow): Pick<Run, "errorCode" | "errorFamily" | "errorDetail"> {
+  const code = (FAILURE_CODES as readonly string[]).includes(r.error_code ?? "") ? (r.error_code as FailureCode) : null;
+  if (!code) return { errorCode: null, errorFamily: null, errorDetail: null };
+  let detail: FailureDetail | null = null;
+  if (r.error_detail_json) {
+    try {
+      const v = JSON.parse(r.error_detail_json);
+      if (typeof v === "object" && v !== null && !Array.isArray(v)) detail = v as FailureDetail;
+    } catch {
+      /* keep null */
+    }
+  }
+  return { errorCode: code, errorFamily: FAILURE_FAMILY[code], errorDetail: detail };
+}
+
+/** NULL for rows before migration 13 and for runs whose result had no modelUsage. */
+function parseUsageByModel(json: string | null | undefined): UsageByModel | null {
+  if (!json) return null;
+  try {
+    const v = JSON.parse(json);
+    return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as UsageByModel) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -112,6 +167,8 @@ function parsePhases(json: string | null | undefined): RunPhase[] {
 
 export interface ListRunsFilter {
   status?: RunStatus;
+  /** Only real runs or only gate runs; both when omitted. */
+  kind?: RunKind;
   agentId?: string;
   projectPath?: string;
   limit?: number;
@@ -137,18 +194,25 @@ export type RunPatch = Partial<
     | "outputTokens"
     | "cacheReadTokens"
     | "cacheCreationTokens"
+    | "usageByModel"
     | "costUsd"
     | "permissionDenials"
     | "deniedTools"
     | "mcp"
     | "humanIntervention"
     | "contextExhausted"
+    | "errorCode"
+    | "errorFamily"
+    | "errorDetail"
     | "retries"
     | "logPath"
     | "rawResultJson"
     | "command"
     | "phases"
     | "reviewReasons"
+    | "billingType"
+    | "claudeCodeVersion"
+    | "lastEventAt"
   >
 >;
 
@@ -169,18 +233,25 @@ const PATCH_COLUMNS: Record<keyof RunPatch, string> = {
   outputTokens: "output_tokens",
   cacheReadTokens: "cache_read_tokens",
   cacheCreationTokens: "cache_creation_tokens",
+  usageByModel: "usage_by_model_json",
   costUsd: "cost_usd",
   permissionDenials: "permission_denials",
   deniedTools: "denied_tools_json",
   mcp: "mcp_json",
   humanIntervention: "human_intervention",
   contextExhausted: "context_exhausted",
+  errorCode: "error_code",
+  errorFamily: "error_family",
+  errorDetail: "error_detail_json",
   retries: "retries",
   logPath: "log_path",
   rawResultJson: "raw_result_json",
   command: "command_json",
   phases: "phases_json",
   reviewReasons: "review_reasons_json",
+  billingType: "billing_type",
+  claudeCodeVersion: "claude_code_version",
+  lastEventAt: "last_event_at",
 };
 
 /**
@@ -208,7 +279,12 @@ function rowToSummary(r: SummaryRow): RunSummary {
 }
 
 export class RunRepository {
-  constructor(private readonly db: DatabaseSync) {}
+  /** Budgets live in the same database; RunManager.startRun checks them before every spawn. */
+  readonly budgets: BudgetRepository;
+
+  constructor(private readonly db: DatabaseSync) {
+    this.budgets = new BudgetRepository(db);
+  }
 
   insert(run: Run): void {
     this.db
@@ -217,8 +293,10 @@ export class RunRepository {
            created_at, started_at, ended_at, duration_ms, claude_session_id, permission_mode, command_json,
            exit_code, termination_reason, error, result_text, num_turns, tool_calls, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, permission_denials, denied_tools_json, mcp_json, human_intervention,
-           context_exhausted, retries, log_path, raw_result_json, schedule_id, owner, phases_json, review_reasons_json, resumed_from_run_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           context_exhausted, retries, log_path, raw_result_json, schedule_id, owner, phases_json, review_reasons_json, resumed_from_run_id, kind,
+           usage_by_model_json, billing_type, error_code, error_family, error_detail_json, agent_hash, claude_code_version,
+           last_event_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         run.id,
@@ -260,6 +338,15 @@ export class RunRepository {
         JSON.stringify(run.phases ?? []),
         run.reviewReasons?.length ? JSON.stringify(run.reviewReasons) : null,
         run.resumedFromRunId ?? null,
+        run.kind ?? "run",
+        run.usageByModel ? JSON.stringify(run.usageByModel) : null,
+        run.billingType ?? null,
+        run.errorCode ?? null,
+        run.errorFamily ?? null,
+        run.errorDetail ? JSON.stringify(run.errorDetail) : null,
+        run.agentHash ?? null,
+        run.claudeCodeVersion ?? null,
+        run.lastEventAt ?? null,
       );
   }
 
@@ -338,6 +425,10 @@ export class RunRepository {
       where.push("agent_id = ?");
       values.push(filter.agentId);
     }
+    if (filter.kind) {
+      where.push("kind = ?");
+      values.push(filter.kind);
+    }
     if (filter.projectPath) {
       where.push("project_path = ?");
       values.push(filter.projectPath);
@@ -350,6 +441,17 @@ export class RunRepository {
 
   listByStatus(status: RunStatus): Run[] {
     return (this.db.prepare("SELECT * FROM runs WHERE status = ?").all(status) as unknown as RunRow[]).map(rowToRun);
+  }
+
+  /**
+   * Runs of an agent created at or after `sinceIso` (every kind and outcome) and their recorded
+   * cost (runs still going, or that never reported one, add 0). The daily caps read it.
+   */
+  agentUsageSince(agentId: string, sinceIso: string): { runs: number; costUsd: number } {
+    const r = this.db
+      .prepare("SELECT COUNT(*) AS runs, SUM(cost_usd) AS cost FROM runs WHERE agent_id = ? AND created_at >= ?")
+      .get(agentId, sinceIso) as { runs: number; cost: number | null };
+    return { runs: r.runs, costUsd: r.cost ?? 0 };
   }
 
   /** How the given runs ended, in one query and without their result blobs. Unknown ids are left out. */
@@ -391,6 +493,14 @@ export class RunRepository {
       payload: r.payload === null ? null : JSON.parse(r.payload),
       agentId: r.agent_id ?? null,
     }));
+  }
+
+  /** The `diff` event's payload (what the run changed in git), or null; read apart from `events`, whose limit may cut it. */
+  diff(runId: string): RunDiff | null {
+    const row = this.db
+      .prepare("SELECT payload FROM run_events WHERE run_id = ? AND type = 'diff' ORDER BY id DESC LIMIT 1")
+      .get(runId) as { payload: string | null } | undefined;
+    return row?.payload ? (JSON.parse(row.payload) as RunDiff) : null;
   }
 
   /** Insert or refresh one subagent invocation. Idempotent on (run_id, agent_id). */

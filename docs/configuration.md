@@ -10,7 +10,7 @@ values (your own projects, your own agents, the MCP registration) live in git-ig
 data_dir: ../data               # SQLite + logs (git-ignored)
 allowed_project_roots: []       # e.g. [~/Documents/Projects]; empty = any directory except / and ~
 default_agent: null              # or an agent id; null = run_agent requires agent_id
-max_concurrent_runs: 2
+max_concurrent_runs: 4
 claude:
   binary: null                  # set to /Users/you/.local/bin/claude if PATH is minimal (GUI launch)
   strict_mcp_config: true       # child sessions ignore user-level MCP servers (faster, no hangs)
@@ -18,6 +18,12 @@ claude:
   allow_bypass_permissions: false
   default_timeout_minutes: 30
   default_max_budget_usd: 5
+scheduler:
+  enabled: true                 # kill switch, re-read every tick
+  tick_seconds: 30
+  default_time_zone: Europe/London
+  noop_pattern: '/^\s*(nothing to do|no .* in ready)/i'   # final message of a run that found no work (idle-cost stats)
+  auto_pause_after: 5           # pause a schedule after this many empty / needs-review runs in a row; 0 = never
 ```
 
 Config is re-read on every run and every `list_*` tool call: edits apply without restarting
