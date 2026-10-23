@@ -332,12 +332,17 @@ export class Scheduler {
 
   /**
    * `retry` = a pending deferred fire tried again (see retryDeferred): next_run_at is left as it
-   * is (the occurrence it waits for has not come yet), and still busy puts it back, writing no row.
+   * is (the occurrence it waits for has not come yet), and still busy puts it back, writing no row
+   * (only a spend row when its gate ran).
    */
   private async fire(s: Schedule, manual: boolean, skipGate = false, retry = false): Promise<FireResult> {
-    const nextRunAt = retry ? s.nextRunAt : s.enabled ? this.computeNext(s.cron, s.timeZone) : null;
+    const nextRunAt = retry ? null : s.enabled ? this.computeNext(s.cron, s.timeZone) : null;
+    // A retry keeps next_run_at, re-read right before each write and never taken from the snapshot:
+    // while its gate ran the due loop may have claimed the occurrence and moved next_run_at on, and
+    // writing the stale value back would make that occurrence due a second time.
+    const nextAt = (): string | null => (retry ? (this.repo.get(s.id)?.nextRunAt ?? null) : nextRunAt);
     if (!s.enabled && !manual) {
-      this.repo.recordFiring(s.id, "skipped_disabled", null, null, nextRunAt);
+      this.repo.recordFiring(s.id, "skipped_disabled", null, null, nextAt());
       return { outcome: "skipped_disabled", runId: null, error: null };
     }
     if (!manual) {
@@ -357,7 +362,7 @@ export class Scheduler {
         if (s.resumeBudgetUsd !== null) input.budgetUsd = s.resumeBudgetUsd;
         try {
           const run = await this.runs.resumeRun(input);
-          this.repo.recordFiring(s.id, "resumed", run.id, null, nextRunAt);
+          this.repo.recordFiring(s.id, "resumed", run.id, null, nextAt());
           log.info("schedule fired as a resume", {
             schedule: s.name,
             runId: run.id,
@@ -399,7 +404,7 @@ export class Scheduler {
         }
         gateSpend = { runId: verdict.gateRunId, costUsd: verdict.costUsd };
         if (verdict.kind === "skip") {
-          this.repo.recordFiring(s.id, "skipped_gate", null, verdict.reason, nextRunAt, gateSpend);
+          this.repo.recordFiring(s.id, "skipped_gate", null, verdict.reason, nextAt(), gateSpend);
           log.info("schedule skipped by its gate", {
             schedule: s.name,
             reason: verdict.reason.slice(0, 200),
@@ -424,7 +429,7 @@ export class Scheduler {
       const run = await this.runs.startRun(input);
       if (resumable && resumeError)
         this.runs.note(run.id, `started fresh: the resume of run ${resumable.id} was refused (${resumeError})`);
-      this.repo.recordFiring(s.id, "started", run.id, null, nextRunAt, gateSpend);
+      this.repo.recordFiring(s.id, "started", run.id, null, nextAt(), gateSpend);
       log.info("schedule fired", { schedule: s.name, runId: run.id, manual, gated: gateSpend !== null });
       return {
         outcome: "started",
@@ -438,9 +443,23 @@ export class Scheduler {
         if (retry && s.deferredUntil) {
           // Still busy: put the pending back as it was (same deadline, the original tick's
           // message) and write nothing, so a long busy spell is one `deferred` row, not one per tick.
-          this.repo.defer(s.id, s.deferredUntil, s.deferredReason ?? message);
-          log.debug("deferred fire still busy", { schedule: s.name, deferredUntil: s.deferredUntil, message });
-          return { outcome: "deferred", runId: null, error: message };
+          // Only if nothing is pending now: a fresher pending (the next occurrence deferred by the
+          // due loop while this retry's gate ran) must not be overwritten by the stale one.
+          const restored = this.repo.restoreDeferred(s.id, s.deferredUntil, s.deferredReason ?? message);
+          // A gate that ran cost something: keep its spend in a row of its own (schedule untouched).
+          if (gateSpend) this.repo.recordGateSpend(s.id, "deferred", message, gateSpend);
+          log.debug("deferred fire still busy", {
+            schedule: s.name,
+            deferredUntil: s.deferredUntil,
+            restored,
+            message,
+          });
+          return {
+            outcome: "deferred",
+            runId: null,
+            error: message,
+            ...(gateSpend ? { gateRunId: gateSpend.runId, gateCostUsd: gateSpend.costUsd } : {}),
+          };
         }
         if (!retry && nextRunAt) {
           this.repo.recordFiring(s.id, "deferred", null, message, nextRunAt, gateSpend);
@@ -459,7 +478,7 @@ export class Scheduler {
               ? "skipped_budget"
               : "error";
       // A budget refusal has just paused the schedule: keep next_run_at cleared, as a pause does.
-      const next = outcome === "skipped_budget" && !this.repo.get(s.id)?.enabled ? null : nextRunAt;
+      const next = outcome === "skipped_budget" && !this.repo.get(s.id)?.enabled ? null : nextAt();
       this.repo.recordFiring(s.id, outcome, null, message, next, gateSpend);
       (outcome === "error" ? log.warn : log.info)("schedule not started", { schedule: s.name, outcome, message });
       return { outcome, runId: null, error: message };

@@ -271,6 +271,38 @@ export class ScheduleRepository {
   }
 
   /**
+   * Put a pending deferred fire back after a retry that was busy again, only if nothing is pending
+   * now: a fresher pending recorded meanwhile (the due loop deferring the next occurrence while
+   * this retry's gate ran) wins over the stale one. True when it was put back.
+   */
+  restoreDeferred(id: string, until: string, reason: string): boolean {
+    const r = this.db
+      .prepare(
+        "UPDATE schedules SET deferred_until = ?, deferred_reason = ?, updated_at = ? WHERE id = ? AND deferred_until IS NULL",
+      )
+      .run(until, reason, new Date().toISOString(), id);
+    return Number(r.changes) > 0;
+  }
+
+  /**
+   * A firing row that only carries a gate's spend, leaving the schedule row untouched: a deferred
+   * retry whose gate ran but whose run was refused busy afterwards. Keeps gateSpendSince accurate
+   * without moving next_run_at or the last outcome.
+   */
+  recordGateSpend(
+    id: string,
+    outcome: ScheduleOutcome,
+    error: string | null,
+    gate: { runId: string | null; costUsd: number | null },
+  ): void {
+    this.db
+      .prepare(
+        "INSERT INTO schedule_firings (schedule_id, fired_at, outcome, run_id, error, gate_run_id, gate_cost_usd) VALUES (?, ?, ?, NULL, ?, ?, ?)",
+      )
+      .run(id, new Date().toISOString(), outcome, error, gate.runId, gate.costUsd ?? 0);
+  }
+
+  /**
    * Compare-and-set take of a pending deferred fire: clear it only if it still holds the deadline
    * this process read. True when this call took it (then retry, expire or drop it); false when
    * someone else took or replaced it meanwhile.

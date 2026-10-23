@@ -227,9 +227,12 @@ the smallest form instead. With `scheduler.defer_busy: true` (the default, in `d
   `deferred` and stays pending on the row (`deferredUntil` = the next cron occurrence,
   `deferredReason` = the busy message; a **deferred** badge on the dashboard).
 - Every tick retries it (busy check first, then the gate if any). A retry that is busy again
-  writes nothing: one busy spell is one `deferred` row, not one per tick. When the guard has
+  writes nothing: one busy spell is one `deferred` row, not one per tick (only a retry whose
+  gate ran and was refused afterwards adds a `deferred` row carrying the gate's cost, so the
+  gate spend stays counted). It is put back only if nothing newer is pending. When the guard has
   cleared the fire starts as usual (`started` or `resumed`, the run carries the `scheduleId`)
-  and `next_run_at` is not moved.
+  and `next_run_at` is not moved (re-read at that moment: a long gate never writes back an
+  occurrence that was claimed meanwhile).
 - One pending per schedule, never more: when the next cron occurrence comes before it started,
   the pending is dropped and recorded as `skipped_busy` with the original tick's message (a lost
   trigger shows as lost), and that occurrence fires normally (deferred again if still busy).

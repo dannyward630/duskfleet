@@ -1561,6 +1561,66 @@ test("defer_busy: a paused or auto-paused schedule never starts from a pending",
   }
 });
 
+test("defer_busy: a gated retry that outlasts its occurrence never writes a stale next_run_at or a stale pending back", async () => {
+  const { root, configDir } = makeDeferRoot();
+  const t = makeScheduler(configDir);
+  let blockerRun = null;
+  try {
+    const s = t.scheduler.create({
+      name: "slow retry",
+      agentId: "gatekeeper",
+      prompt: "ok",
+      cron: "0 3 * * *",
+      gate: { command: "sleep 1; exit 1", timeoutSeconds: 10 },
+    });
+    const staleUntil = new Date(Date.now() + 3_600_000).toISOString();
+    const pend = () =>
+      t.db
+        .prepare("UPDATE schedules SET next_run_at = ?, deferred_until = ?, deferred_reason = ? WHERE id = ?")
+        .run(new Date(Date.now() - 1000).toISOString(), staleUntil, "project busy: an earlier tick", s.id);
+
+    // A pending whose occurrence is already due: the retry's gate is still running when the due
+    // loop claims that occurrence (deferred: the gate is busy) and moves next_run_at on.
+    pend();
+    await t.tickAll();
+    let row = t.repo.get(s.id);
+    assert.deepEqual(
+      t.repo.firings(s.id).map((f) => f.outcome),
+      ["skipped_gate", "deferred"],
+    );
+    assert.ok(row.nextRunAt > new Date().toISOString(), "the gated retry did not write the claimed occurrence back");
+    assert.equal(
+      t.repo.due(new Date().toISOString()).some((d) => d.id === s.id),
+      false,
+      "the claimed occurrence does not fire a second time",
+    );
+    assert.equal(row.deferredUntil, row.nextRunAt, "the due loop's pending stands");
+
+    // Same race, but the gate lets the run through and the project is busy by then: the retry
+    // does not overwrite the fresher pending, and its gate's spend gets a row of its own.
+    t.scheduler.update(s.id, { gate: { command: "sleep 1; exit 0", timeoutSeconds: 10 } });
+    pend();
+    await t.scheduler.tick();
+    const fresh = t.repo.get(s.id);
+    assert.ok(fresh.deferredUntil && fresh.deferredUntil !== staleUntil, "the due loop deferred the new occurrence");
+    blockerRun = (await t.runs.startRun({ prompt: "hang", agentId: "blocker" })).id;
+    await t.scheduler.settled();
+    row = t.repo.get(s.id);
+    assert.equal(row.deferredUntil, fresh.deferredUntil, "the stale pending did not replace the fresh one");
+    assert.equal(row.deferredReason, fresh.deferredReason);
+    assert.equal(row.nextRunAt, fresh.nextRunAt);
+    const [spend, deferred] = t.repo.firings(s.id);
+    assert.equal(spend.outcome, "deferred");
+    assert.match(spend.error, /project busy/);
+    assert.equal(spend.gateCostUsd, 0, "the gate's check is counted");
+    assert.equal(deferred.outcome, "deferred");
+    assert.equal(t.scheduler.idleStats(row).gateChecks, 2);
+  } finally {
+    if (blockerRun) t.runs.cancelRun(blockerRun);
+    await t.close(root);
+  }
+});
+
 test("defer_busy: daily cap skips are not deferred; turning defer_busy off settles a pending as skipped_busy", async () => {
   const { root, configDir } = makeDeferRoot();
   writeFileSync(path.join(configDir, "agents", "once.md"), `---\nproject: demo\nmax_daily_runs: 1\n---\nOnce.\n`);
