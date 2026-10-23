@@ -79,7 +79,7 @@ login and spends nothing: the tests use the fake binary. In order:
 | Public-repo hygiene | `npm run check:public` | A versioned file contains a home path, the committing machine's user or host name, or the index holds a symlink. Placeholders `<you>`, `you`, `me` are fine. |
 | Lint + format | `npm run lint` (`biome ci .`; `npm run lint:fix` repairs) | A Biome lint error or an unformatted file. Warnings (`noNonNullAssertion`, `noExplicitAny`, …) do not block. In `packages/core` an import of the MCP SDK, React or Next.js is an error. |
 | Build | `npm run build` | `tsc` errors in core or mcp |
-| Docs sync | `npm run check:docs` (after the build: it reads `packages/mcp/dist/tools.json`) | An MCP tool the server registers has no row in `docs/mcp-server.md`, a `ScheduleOutcome` value is not listed there, or a `docs/*.md` page is not linked from `README.md`. |
+| Docs sync | `npm run check:docs` (after the build: it reads `packages/mcp/dist/tools.json`) | An MCP tool the server registers has no row in `docs/mcp-server.md`, a `ScheduleOutcome` value is not listed there, a `docs/*.md` page is not linked from `README.md`, or the README's tool count is stale. |
 | Typecheck | `npm run typecheck`, `npm run typecheck -w @duskfleet/web` | Type errors anywhere |
 | Tests + coverage | `npm run test:coverage` | A failing test, or line coverage of the in-process code under 80 % |
 | Dashboard build | `npm run build:web` | `next build` errors (Server Component rules `tsc` does not see) |

@@ -7,7 +7,8 @@
  *      (a line starting with "| `<tool>` |"), or
  *   2. a member of the ScheduleOutcome union (packages/core/src/scheduler/types.ts) is not
  *      named in docs/mcp-server.md, or
- *   3. a docs/*.md page is not linked from README.md.
+ *   3. a docs/*.md page is not linked from README.md, or
+ *   4. README.md states a tool count ("15 tools", "15 MCP tools") other than the catalogue's.
  *
  * Tool names come from the generated catalogue packages/mcp/dist/tools.json (written by
  * `npm run build`), so this script never imports the server. Run it after the build.
@@ -62,6 +63,13 @@ const pages = readdirSync(path.join(root, "docs"))
   .sort();
 for (const page of pages) {
   if (!linked.has(page)) problems.push(`README.md: docs/${page} is not linked`);
+}
+
+// 4. Every tool count in README.md ("18 tools", "18 MCP tools") matches the catalogue.
+for (const m of readme.matchAll(/\b(\d+) (?:MCP )?tools\b/g)) {
+  if (Number(m[1]) !== tools.length) {
+    problems.push(`README.md: "${m[0]}" but the server registers ${tools.length} MCP tools`);
+  }
 }
 
 if (problems.length) {
