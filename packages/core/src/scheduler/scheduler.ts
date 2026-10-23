@@ -6,8 +6,13 @@
  *  - No catch-up (`catch_up_policy: skip_missed`, the only implemented value). Ticks
  *    missed while nobody was running are not replayed: the schedule fires once when
  *    next considered and its next_run_at is recomputed from now. Hourly jobs do not want a burst.
- *  - Busy is a skip, never a queue (`concurrency_policy: skip_if_active`, the only value).
- *    RunManager's per-agent / per-project guards throw; the firing is recorded as `skipped_busy`.
+ *  - Busy is never a queue (`concurrency_policy: skip_if_active`, the only value). RunManager's
+ *    per-agent / per-project guards throw BusyError. With `scheduler.defer_busy` (default) a
+ *    scheduled fire is recorded `deferred` and kept as ONE pending fire per schedule
+ *    (`deferred_until` = the next cron occurrence): every tick retries it, a retry that is busy
+ *    again writes nothing, a start settles it, a pause drops it, and once the next occurrence
+ *    comes it is dropped as `skipped_busy` and the normal fire takes over. Without it, or for a
+ *    manual fire (the caller is there to retry), the firing is `skipped_busy`.
  *  - An agent over its daily cap (max_daily_runs / max_daily_cost_usd, UTC day) is a
  *    skip too, recorded as `skipped_daily_cap`.
  *  - A spent hard-stop budget (global / agent / project, UTC month) is `skipped_budget`; the
@@ -247,6 +252,9 @@ export class Scheduler {
         log.info("run requested", { schedule: s.name, requestedAt: s.runRequestedAt });
         await this.dispatch(s, true);
       }
+      // Deferred busy fires next, before the due ones: a pending whose next occurrence has come
+      // is settled here first (skipped_busy), so the due loop below fires that occurrence normally.
+      await this.retryDeferred(config.scheduler.deferBusy);
       for (const s of this.repo.due(this.now().toISOString())) {
         await this.dispatch(s, false);
       }
@@ -274,9 +282,10 @@ export class Scheduler {
    * A scheduled (non-manual) fire is claimed first with a compare-and-set on the next_run_at
    * this tick read: if another process fired it meanwhile (the lease changed hands between
    * `due()` and here), the claim fails and this tick leaves it alone, recording nothing.
+   * A retry of a deferred fire (`retry`) was claimed by `retryDeferred` (takeDeferred) instead.
    */
-  private async dispatch(s: Schedule, manual: boolean): Promise<void> {
-    if (!manual) {
+  private async dispatch(s: Schedule, manual: boolean, retry = false): Promise<void> {
+    if (!manual && !retry) {
       const next = s.enabled ? this.computeNext(s.cron, s.timeZone) : null;
       if (!this.repo.claimDue(s.id, s.nextRunAt, next)) {
         log.info("tick already claimed elsewhere; not firing", { schedule: s.name, nextRunAt: s.nextRunAt });
@@ -284,10 +293,10 @@ export class Scheduler {
       }
     }
     if (!s.gate) {
-      await this.fire(s, manual);
+      await this.fire(s, manual, false, retry);
       return;
     }
-    const p: Promise<FireResult> = this.fire(s, manual)
+    const p: Promise<FireResult> = this.fire(s, manual, false, retry)
       .catch((err): FireResult => {
         const message = err instanceof Error ? err.message : String(err);
         log.error("gated fire failed", { schedule: s.name, err: message });
@@ -297,8 +306,36 @@ export class Scheduler {
     this.background.add(p);
   }
 
-  private async fire(s: Schedule, manual: boolean, skipGate = false): Promise<FireResult> {
-    const nextRunAt = s.enabled ? this.computeNext(s.cron, s.timeZone) : null;
+  /**
+   * Take every pending deferred fire (compare-and-set, so a lease handover cannot retry it twice)
+   * and settle or retry it: paused schedule = dropped; next occurrence reached (or `defer_busy`
+   * turned off) = `skipped_busy` with the original tick's message; otherwise fired again as a
+   * scheduled fire that keeps next_run_at, and put back by `fire` if it is still busy.
+   */
+  private async retryDeferred(deferBusy: boolean): Promise<void> {
+    const nowIso = this.now().toISOString();
+    for (const s of this.repo.deferred()) {
+      const until = s.deferredUntil;
+      if (!until || !this.repo.takeDeferred(s.id, until)) continue;
+      if (!s.enabled) {
+        log.info("deferred fire dropped: schedule paused", { schedule: s.name, pausedReason: s.pausedReason });
+        continue;
+      }
+      if (until <= nowIso || !deferBusy) {
+        this.repo.recordFiring(s.id, "skipped_busy", null, s.deferredReason, s.nextRunAt);
+        log.info("deferred fire expired", { schedule: s.name, deferredUntil: until, deferBusy });
+        continue;
+      }
+      await this.dispatch(s, false, true);
+    }
+  }
+
+  /**
+   * `retry` = a pending deferred fire tried again (see retryDeferred): next_run_at is left as it
+   * is (the occurrence it waits for has not come yet), and still busy puts it back, writing no row.
+   */
+  private async fire(s: Schedule, manual: boolean, skipGate = false, retry = false): Promise<FireResult> {
+    const nextRunAt = retry ? s.nextRunAt : s.enabled ? this.computeNext(s.cron, s.timeZone) : null;
     if (!s.enabled && !manual) {
       this.repo.recordFiring(s.id, "skipped_disabled", null, null, nextRunAt);
       return { outcome: "skipped_disabled", runId: null, error: null };
@@ -397,6 +434,21 @@ export class Scheduler {
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof BusyError && !manual && this.runs.config.scheduler.deferBusy) {
+        if (retry && s.deferredUntil) {
+          // Still busy: put the pending back as it was (same deadline, the original tick's
+          // message) and write nothing, so a long busy spell is one `deferred` row, not one per tick.
+          this.repo.defer(s.id, s.deferredUntil, s.deferredReason ?? message);
+          log.debug("deferred fire still busy", { schedule: s.name, deferredUntil: s.deferredUntil, message });
+          return { outcome: "deferred", runId: null, error: message };
+        }
+        if (!retry && nextRunAt) {
+          this.repo.recordFiring(s.id, "deferred", null, message, nextRunAt, gateSpend);
+          this.repo.defer(s.id, nextRunAt, message);
+          log.info("schedule busy; fire deferred", { schedule: s.name, deferredUntil: nextRunAt, message });
+          return { outcome: "deferred", runId: null, error: message };
+        }
+      }
       // Structured, never matched on the text: a gate's stderr may well say "project busy".
       const outcome: ScheduleOutcome =
         err instanceof BusyError
