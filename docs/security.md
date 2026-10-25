@@ -20,7 +20,7 @@ Agent `allowed_tools` and `disallowed_tools` are forwarded to Claude Code as `--
 
 ## Schedule command gates
 
-Command gates are disabled by default (`scheduler.allow_command_gates: false`). When enabled, a gate runs the configured command through `/bin/sh -c` in the project directory, with the environment of the Duskfleet process. It runs as a shell command outside Claude Code's tool allow-list. Enable command gates only when you trust the schedule configuration and the callers who can create or change schedules. ([configuration defaults](configuration.md#configduskfleetyaml), [`evaluateGate()`](../packages/core/src/scheduler/gate.ts#L130-L140))
+Command gates are disabled by default (`scheduler.allow_command_gates: false`). When enabled, a gate runs the configured command through `/bin/sh -c` in the project directory, with the environment of the Duskfleet process. It runs as a shell command outside Claude Code's tool allow-list. Enable command gates only when you trust the schedule configuration and the callers who can create or change schedules. ([configuration defaults](configuration.md#configduskfleetyaml), [`runCommandGate()`](../packages/core/src/scheduler/gate.ts#L114-L140), [`evaluateGate()`](../packages/core/src/scheduler/gate.ts#L251-L262), [`commandGateRefusal()`](../packages/core/src/scheduler/crud.ts#L120-L128))
 
 ## Dashboard
 
@@ -36,6 +36,6 @@ The per-run JSONL log receives each child stdout line and tagged stderr; stdout 
 
 - Run Duskfleet under a dedicated user or process environment that does not contain unrelated credentials; the child inherits the Duskfleet environment as described above. ([`childEnv()`](../packages/core/src/execution/claude-code.ts#L440-L449))
 - Set a nonempty `allowed_project_roots` list and review project and agent `add_dirs` entries before unattended use. ([`validateProjectPath()`](../packages/core/src/orchestration/project-validation.ts#L37-L52), [project configuration](configuration.md#projects-configprojectsyaml-optional), [agent configuration](agents.md#frontmatter))
-- Keep `scheduler.allow_command_gates` disabled unless the commands and schedule writers are trusted. ([configuration defaults](configuration.md#configduskfleetyaml), [`evaluateGate()`](../packages/core/src/scheduler/gate.ts#L130-L140))
+- Keep `scheduler.allow_command_gates` disabled unless the commands and schedule writers are trusted. ([configuration defaults](configuration.md#configduskfleetyaml), [`evaluateGate()`](../packages/core/src/scheduler/gate.ts#L251-L262), [`commandGateRefusal()`](../packages/core/src/scheduler/crud.ts#L120-L128))
 - Use an explicit low-cost model while experimenting and configure a maximum budget for agents or runs. ([quick-start warning](../README.md#quick-start), [budget configuration](configuration.md#configduskfleetyaml), [`buildArgv()`](../packages/core/src/execution/claude-code.ts#L110-L114))
 - Keep the dashboard bound to loopback; its current Host check does not authenticate users. ([dashboard scripts](../apps/web/package.json#L7-L11), [middleware](../apps/web/middleware.ts#L4-L10))
